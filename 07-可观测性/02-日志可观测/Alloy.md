@@ -8,6 +8,7 @@
 2. 官方文档：[Grafana Alloy Docs](https://grafana.com/docs/alloy/latest/)
 3. Loki 日志采集：[Send logs to Loki via Alloy](https://grafana.com/docs/loki/latest/send-data/alloy/)
 4. River 配置语言：[River Reference](https://grafana.com/docs/alloy/latest/reference/)
+5. ai-问答：https://grafana.com/grot/
 
 > Star 数会持续变化。正式对外汇报前建议以 GitHub 实时数据复核。
 
