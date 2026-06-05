@@ -1,0 +1,976 @@
+﻿# =============================================================================
+# SmartVision 统一 CI/CD 模板
+# =============================================================================
+#
+# 分支策略（逐层累加质量门禁）：
+#   feature/*  → lint only
+#   dev        → lint + sonar + gitleaks + oasdiff + build + deploy-dev
+#   pre        → lint + sonar + gitleaks + oasdiff + build + trivy + llm-cve + deploy-pre
+#   main       → lint + sonar + gitleaks + oasdiff + build + trivy + preflight + llm-summary
+#   Tag v*.*.*  → ftp-push + feishu 审批 + deploy-prod（手动）+ notify + dora
+#
+# 使用方式：在项目 .gitlab-ci.yml 中 include 此模板，按需覆盖变量
+#   include:
+#     - project: 'platform/cicd-templates'
+#       ref: main
+#       file: '/templates/.gitlab-ci.yml'
+#
+# 必须在 GitLab CI/CD Variables 中设置（Protected + Masked）：
+#   HARBOR_USER, HARBOR_PASS
+#   SONAR_TOKEN
+#   GITLAB_API_TOKEN
+#   FTP_HOST, FTP_USER, FTP_PASS
+#   FEISHU_WEBHOOK
+# =============================================================================
+
+stages:
+  - lint
+  - check       # sonar + gitleaks + oasdiff 并行
+  - build
+  - scan        # trivy + llm-cve-triage
+  - deploy-dev
+  - deploy-pre
+  - preflight   # preflight + llm-release-summary（main 分支）
+  - release     # ftp-push + feishu-approval（Tag）
+  - deploy-prod # 手动触发（Tag）
+  - notify      # 飞书上线通知 + DORA（Tag）
+  - .post       # 失败兜底（任意分支失败时）
+
+# --------------------------------------------------------------------------
+# 全局变量（在项目 .gitlab-ci.yml 中覆盖所需项）
+# --------------------------------------------------------------------------
+variables:
+  # Harbor — 三套独立仓库，按环境隔离
+  HARBOR_URL_DEV: "harbor-dev.internal"
+  HARBOR_URL_PRE: "harbor-pre.internal"
+  HARBOR_URL_PROD: "harbor.internal"
+  HARBOR_PROJECT: "platform"
+  IMAGE_NAME_DEV: "${HARBOR_URL_DEV}/${HARBOR_PROJECT}/${CI_PROJECT_NAME}"
+  IMAGE_NAME_PRE: "${HARBOR_URL_PRE}/${HARBOR_PROJECT}/${CI_PROJECT_NAME}"
+  IMAGE_NAME_PROD: "${HARBOR_URL_PROD}/${HARBOR_PROJECT}/${CI_PROJECT_NAME}"
+  # Harbor 认证（在 GitLab CI/CD Variables 中分别设置，Protected + Masked）：
+  #   HARBOR_USER_DEV, HARBOR_PASS_DEV
+  #   HARBOR_USER_PRE, HARBOR_PASS_PRE
+  #   HARBOR_USER_PROD, HARBOR_PASS_PROD
+
+  # 语言类型：python | java | go
+  LANG_TYPE: "python"
+
+  # 部署方式：kubectl | argocd | docker | binary
+  DEPLOY_TYPE_DEV: "kubectl"
+  DEPLOY_TYPE_PRE: "kubectl"
+  DEPLOY_TYPE_PROD: "kubectl"
+
+  # K8s 命名空间
+  K8S_NAMESPACE_DEV: "dev"
+  K8S_NAMESPACE_PRE: "pre"
+  K8S_NAMESPACE_PROD: "prod"
+  K8S_DEPLOYMENT_NAME: "${CI_PROJECT_NAME}"
+  # K8s 认证（在 GitLab CI/CD Variables 中设置，类型 File，Protected + Masked）：
+  #   KUBECONFIG_DEV   ← dev 集群 kubeconfig
+  #   KUBECONFIG_PRE   ← pre 集群 kubeconfig
+  #   KUBECONFIG_PROD  ← prod 集群 kubeconfig
+  # 获取方式：kubectl config view --raw > kubeconfig.yaml，然后作为 File 类型变量上传
+
+  # ArgoCD（DEPLOY_TYPE=argocd 时使用）
+  ARGOCD_SERVER: "argocd.devtools.svc.cluster.local"
+  ARGOCD_APP_DEV: "${CI_PROJECT_NAME}-dev"
+  ARGOCD_APP_PRE: "${CI_PROJECT_NAME}-pre"
+  ARGOCD_APP_PROD: "${CI_PROJECT_NAME}-prod"
+
+  # SonarQube（K8s devtools namespace，NodePort 30900）
+  SONAR_HOST_URL: "http://sonarqube.devtools.svc.cluster.local:9000"
+
+  # 内网 vLLM（Qwen2.5-Coder-32B-Instruct）
+  VLLM_URL: "http://vllm-service.ai-infra.svc.cluster.local:8000/v1/chat/completions"
+  VLLM_MODEL: "Qwen2.5-Coder-32B-Instruct"
+
+  # OpenAPI spec 路径（oasdiff 使用，按需覆盖）
+  OPENAPI_SPEC_PATH: "openapi.yaml"
+
+  # Prometheus Pushgateway（DORA 指标）
+  PUSHGATEWAY_URL: "http://pushgateway.monitoring.svc.cluster.local:9091"
+
+  # SSH 部署目标（DEPLOY_TYPE=docker|binary 时使用，按需覆盖）
+  DEV_HOST: ""
+  PRE_HOST: ""
+  PROD_HOST: ""
+  SSH_USER: "deploy"
+  SSH_PORT: "22"
+  # SSH 私钥（在 GitLab CI/CD Variables 中设置，Protected + Masked，类型 File）：
+  #   SSH_PRIVATE_KEY   ← PEM 格式私钥，对应目标机器 ~/.ssh/authorized_keys
+
+  # FTP（私有化交付，离线包 + 二进制推送）
+  FTP_HOST: "ftp.internal"
+  # FTP 认证（在 GitLab CI/CD Variables 中设置，Protected + Masked）：
+  #   FTP_USER, FTP_PASS
+
+  # 飞书机器人（发布审批卡片 + 部署通知）
+  FEISHU_WEBHOOK: "https://open.feishu.cn/open-apis/bot/v2/hook/xxxxxxxx-xxxx-xxxx-xxxx-xxxxxxxxxxxx"
+  # 若审批卡片与通知使用不同机器人，可再加：
+  # FEISHU_APPROVAL_WEBHOOK: "https://open.feishu.cn/open-apis/bot/v2/hook/..."
+
+  # 二进制路径（DEPLOY_TYPE=binary 时使用，按需覆盖）
+  BINARY_PATH: "./app"
+
+
+# ==============================================================================
+# ① feature/* 分支 — 仅 lint
+# ==============================================================================
+
+lint:
+  stage: lint
+  rules:
+    - if: '$CI_COMMIT_BRANCH =~ /^feature\//'
+    - if: '$CI_COMMIT_BRANCH == "dev"'
+    - if: '$CI_COMMIT_BRANCH == "pre"'
+    - if: '$CI_COMMIT_BRANCH == "main"'
+  script:
+    - |
+      if [ "$LANG_TYPE" = "python" ]; then
+        pip install ruff --quiet
+        ruff check . --output-format=github
+      elif [ "$LANG_TYPE" = "java" ]; then
+        mvn checkstyle:check -q
+      elif [ "$LANG_TYPE" = "go" ]; then
+        curl -sSfL https://raw.githubusercontent.com/golangci/golangci-lint/master/install.sh \
+          | sh -s -- -b "$(go env GOPATH)/bin" v1.57.2
+        golangci-lint run ./...
+      fi
+
+
+# ==============================================================================
+# ② dev / pre / main 分支 — check 阶段（并行）
+# ==============================================================================
+
+sonarqube:
+  stage: check
+  rules:
+    - if: '$CI_COMMIT_BRANCH == "dev"'
+    - if: '$CI_COMMIT_BRANCH == "pre"'
+    - if: '$CI_COMMIT_BRANCH == "main"'
+  # Phase 0-1：收集基线，allow_failure: true；Phase 2 后改为 false
+  allow_failure: true
+  image: sonarsource/sonar-scanner-cli:latest
+  variables:
+    SONAR_USER_HOME: "${CI_PROJECT_DIR}/.sonar"
+    GIT_DEPTH: "0"
+  script:
+    - |
+      sonar-scanner \
+        -Dsonar.projectKey="${CI_PROJECT_PATH_SLUG}" \
+        -Dsonar.projectName="${CI_PROJECT_NAME}" \
+        -Dsonar.host.url="${SONAR_HOST_URL}" \
+        -Dsonar.token="${SONAR_TOKEN}" \
+        -Dsonar.qualitygate.wait=true
+  cache:
+    key: "sonar-${CI_PROJECT_PATH_SLUG}"
+    paths:
+      - .sonar/cache
+
+gitleaks:
+  stage: check
+  rules:
+    - if: '$CI_COMMIT_BRANCH == "dev"'
+    - if: '$CI_COMMIT_BRANCH == "pre"'
+    - if: '$CI_COMMIT_BRANCH == "main"'
+  image: zricethezav/gitleaks:latest
+  script:
+    - gitleaks detect --source . --redact --verbose --exit-code 1
+
+oasdiff:
+  stage: check
+  rules:
+    - if: '$CI_COMMIT_BRANCH == "dev"'
+      changes: ["**/*.yaml", "**/*.yml", "**/*.json"]
+    - if: '$CI_COMMIT_BRANCH == "pre"'
+      changes: ["**/*.yaml", "**/*.yml", "**/*.json"]
+    - if: '$CI_COMMIT_BRANCH == "main"'
+      changes: ["**/*.yaml", "**/*.yml", "**/*.json"]
+  image: tufin/oasdiff:latest
+  script:
+    - |
+      git fetch origin "${CI_DEFAULT_BRANCH}" 2>/dev/null || true
+      PREV_SPEC=$(git show "origin/${CI_DEFAULT_BRANCH}:${OPENAPI_SPEC_PATH}" 2>/dev/null)
+      if [ -z "$PREV_SPEC" ]; then
+        echo "No previous spec found, skipping oasdiff."
+        exit 0
+      fi
+      echo "$PREV_SPEC" > /tmp/prev-openapi.yaml
+      oasdiff breaking /tmp/prev-openapi.yaml "${OPENAPI_SPEC_PATH}" --fail-on ERR
+
+
+# ==============================================================================
+# build 阶段（dev / pre / main）
+# ==============================================================================
+
+build:
+  stage: build
+  rules:
+    - if: '$CI_COMMIT_BRANCH == "dev"'
+    - if: '$CI_COMMIT_BRANCH == "pre"'
+    - if: '$CI_COMMIT_BRANCH == "main"'
+  image: docker:24
+  services:
+    - docker:24-dind
+  script:
+    - |
+      if [ "$CI_COMMIT_BRANCH" = "dev" ]; then
+        HARBOR_URL_CURRENT="$HARBOR_URL_DEV"
+        HARBOR_USER_CURRENT="$HARBOR_USER_DEV"
+        HARBOR_PASS_CURRENT="$HARBOR_PASS_DEV"
+        export IMAGE_TAG="${IMAGE_NAME_DEV}:dev_${CI_COMMIT_SHORT_SHA}"
+      elif [ "$CI_COMMIT_BRANCH" = "pre" ]; then
+        HARBOR_URL_CURRENT="$HARBOR_URL_PRE"
+        HARBOR_USER_CURRENT="$HARBOR_USER_PRE"
+        HARBOR_PASS_CURRENT="$HARBOR_PASS_PRE"
+        export IMAGE_TAG="${IMAGE_NAME_PRE}:pre_${CI_COMMIT_SHORT_SHA}"
+      elif [ "$CI_COMMIT_BRANCH" = "main" ]; then
+        HARBOR_URL_CURRENT="$HARBOR_URL_PROD"
+        HARBOR_USER_CURRENT="$HARBOR_USER_PROD"
+        HARBOR_PASS_CURRENT="$HARBOR_PASS_PROD"
+        export IMAGE_TAG="${IMAGE_NAME_PROD}:main_${CI_COMMIT_SHORT_SHA}"
+      fi
+      docker login -u "$HARBOR_USER_CURRENT" -p "$HARBOR_PASS_CURRENT" "$HARBOR_URL_CURRENT"
+    - |
+      docker build \
+        --label "git.commit=${CI_COMMIT_SHA}" \
+        --label "ci.pipeline_url=${CI_PIPELINE_URL}" \
+        --label "build.date=$(date -u +%Y-%m-%dT%H:%M:%SZ)" \
+        --label "branch=${CI_COMMIT_BRANCH}" \
+        -t "${IMAGE_TAG}" .
+    - docker push "${IMAGE_TAG}"
+    - echo "IMAGE_TAG=${IMAGE_TAG}" >> build.env
+  artifacts:
+    reports:
+      dotenv: build.env
+
+
+# ==============================================================================
+# ③ pre 分支 — scan 阶段（Trivy + LLM CVE 定级）
+# ④ main 分支 — scan 阶段（Trivy，不做 LLM 定级）
+# ==============================================================================
+
+trivy:
+  stage: scan
+  rules:
+    - if: '$CI_COMMIT_BRANCH == "pre"'
+    - if: '$CI_COMMIT_BRANCH == "main"'
+  needs: ["build"]
+  image: aquasec/trivy:latest
+  script:
+    - |
+      # 按分支选择 Harbor 认证（trivy 需要能拉取镜像）
+      if [ "$CI_COMMIT_BRANCH" = "pre" ]; then
+        export TRIVY_USERNAME="$HARBOR_USER_PRE"
+        export TRIVY_PASSWORD="$HARBOR_PASS_PRE"
+      elif [ "$CI_COMMIT_BRANCH" = "main" ]; then
+        export TRIVY_USERNAME="$HARBOR_USER_PROD"
+        export TRIVY_PASSWORD="$HARBOR_PASS_PROD"
+      fi
+      trivy image \
+        --exit-code 0 \
+        --format json \
+        --output trivy-report.json \
+        --severity HIGH,CRITICAL \
+        --ignore-unfixed \
+        "${IMAGE_TAG}"
+      echo "Trivy scan complete."
+      # main 分支：有 CRITICAL 则阻断（不经 LLM，直接硬性门禁）
+      if [ "$CI_COMMIT_BRANCH" = "main" ]; then
+        CRITICAL_COUNT=$(python3 -c "
+      import json, sys
+      with open('trivy-report.json') as f: r = json.load(f)
+      total = sum(len([v for v in res.get('Vulnerabilities',[]) if v.get('Severity')=='CRITICAL']) for res in r.get('Results',[]))
+      print(total)
+      " 2>/dev/null || echo 0)
+        if [ "$CRITICAL_COUNT" -gt 0 ]; then
+          echo "❌ main 分支发现 ${CRITICAL_COUNT} 个 CRITICAL CVE，阻断发布。"
+          exit 1
+        fi
+      fi
+  artifacts:
+    paths:
+      - trivy-report.json
+    expire_in: 7 days
+
+# pre 分支：LLM CVE 定级，过滤误报（70% → 20%）
+# 原理：Trivy 报出所有依赖库的 CVE，但约 70% 是"伪告警"——漏洞存在于库中但代码从未调用。
+# LLM 结合服务名称、漏洞描述、部署上下文逐条判断可达性，只留真正需要修复的。
+llm-cve-triage:
+  stage: scan
+  rules:
+    - if: '$CI_COMMIT_BRANCH == "pre"'
+  needs: ["trivy"]
+  image: python:3.11-slim
+  script:
+    - pip install requests --quiet
+    - |
+      python3 << 'PYEOF'
+      import json, requests, os, sys
+
+      with open("trivy-report.json") as f:
+          report = json.load(f)
+
+      vulns = []
+      for result in report.get("Results", []):
+          for v in result.get("Vulnerabilities", []):
+              vulns.append({
+                  "id": v.get("VulnerabilityID"),
+                  "pkg": v.get("PkgName"),
+                  "severity": v.get("Severity"),
+                  "title": v.get("Title", ""),
+                  "description": v.get("Description", "")[:300],
+              })
+
+      if not vulns:
+          print("No vulnerabilities found.")
+          sys.exit(0)
+
+      prompt = f"""你是一个安全工程师。以下是 Trivy 扫描到的 CVE 列表，服务名：{os.environ['CI_PROJECT_NAME']}。
+      请逐条分析，输出 JSON 数组，每条包含：id、level（red/yellow/white）、reason（一句话）。
+
+      评级标准：
+      - red：漏洞函数在此类服务中极可能被调用且影响严重，必须立即修复
+      - yellow：有一定风险但不紧急，计划修复
+      - white：库里有漏洞但此服务基本不会触达该代码路径，可忽略
+
+      CVE 列表：
+      {json.dumps(vulns, ensure_ascii=False, indent=2)}
+
+      只输出 JSON 数组，不要其他内容。"""
+
+      resp = requests.post(
+          os.environ["VLLM_URL"],
+          json={
+              "model": os.environ["VLLM_MODEL"],
+              "messages": [{"role": "user", "content": prompt}],
+              "temperature": 0.1,
+              "max_tokens": 2048,
+          },
+          timeout=120,
+      )
+      result_text = resp.json()["choices"][0]["message"]["content"]
+
+      try:
+          start = result_text.find("[")
+          end = result_text.rfind("]") + 1
+          triage = json.loads(result_text[start:end])
+      except Exception as e:
+          print(f"LLM 输出解析失败：{e}，跳过定级，不阻断。")
+          sys.exit(0)
+
+      red_items = [x for x in triage if x.get("level") == "red"]
+      yellow_items = [x for x in triage if x.get("level") == "yellow"]
+      white_items = [x for x in triage if x.get("level") == "white"]
+
+      with open("cve-triage.json", "w") as f:
+          json.dump(triage, f, ensure_ascii=False, indent=2)
+
+      print(f"\n=== CVE Triage 结果 ===")
+      print(f"总计：{len(triage)} 条 | 🔴 {len(red_items)} | 🟡 {len(yellow_items)} | ⚪ {len(white_items)}")
+
+      if red_items:
+          print("\n🔴 必须立即修复的 CVE：")
+          for item in red_items:
+              print(f"  - {item['id']} | {item.get('reason', '')}")
+          sys.exit(1)  # 阻断 deploy-pre
+
+      print("\n✅ 无 red 级 CVE，允许部署 pre。")
+      PYEOF
+  artifacts:
+    paths:
+      - cve-triage.json
+    expire_in: 7 days
+
+
+# ==============================================================================
+# deploy-dev（dev 分支，自动）
+# ==============================================================================
+
+deploy-dev:
+  stage: deploy-dev
+  rules:
+    - if: '$CI_COMMIT_BRANCH == "dev"'
+  needs: ["build"]
+  environment:
+    name: dev
+    url: "http://${CI_PROJECT_NAME}.dev.internal"
+  script:
+    - |
+      echo "部署 ${IMAGE_TAG} 到 dev 环境（DEPLOY_TYPE=${DEPLOY_TYPE_DEV}）"
+      if [ "$DEPLOY_TYPE_DEV" = "kubectl" ]; then
+        export KUBECONFIG="$KUBECONFIG_DEV"
+        kubectl set image "deployment/${K8S_DEPLOYMENT_NAME}" \
+          "app=${IMAGE_TAG}" \
+          -n "${K8S_NAMESPACE_DEV}"
+        kubectl rollout status "deployment/${K8S_DEPLOYMENT_NAME}" \
+          -n "${K8S_NAMESPACE_DEV}" --timeout=5m
+
+      elif [ "$DEPLOY_TYPE_DEV" = "argocd" ]; then
+        argocd app set "${ARGOCD_APP_DEV}" --helm-set "image.tag=${CI_COMMIT_SHORT_SHA}"
+        argocd app sync "${ARGOCD_APP_DEV}" --timeout 300
+
+      elif [ "$DEPLOY_TYPE_DEV" = "docker" ]; then
+        ssh "deploy@${DEV_HOST}" \
+          "docker pull ${IMAGE_TAG} && \
+           docker-compose -f /opt/${CI_PROJECT_NAME}/docker-compose.yml up -d"
+
+      elif [ "$DEPLOY_TYPE_DEV" = "binary" ]; then
+        ssh "deploy@${DEV_HOST}" \
+          "cp /opt/${CI_PROJECT_NAME}/current \
+              /opt/${CI_PROJECT_NAME}/releases/\$(date +%Y%m%d%H%M%S) 2>/dev/null || true && \
+           cp ${BINARY_PATH} /opt/${CI_PROJECT_NAME}/current && \
+           systemctl restart ${CI_PROJECT_NAME}"
+      fi
+
+
+# ==============================================================================
+# deploy-pre（pre 分支，LLM CVE 定级通过后自动）
+# ==============================================================================
+
+deploy-pre:
+  stage: deploy-pre
+  rules:
+    - if: '$CI_COMMIT_BRANCH == "pre"'
+  needs: ["llm-cve-triage"]
+  environment:
+    name: pre
+    url: "http://${CI_PROJECT_NAME}.pre.internal"
+  script:
+    - |
+      echo "部署 ${IMAGE_TAG} 到 pre 环境（DEPLOY_TYPE=${DEPLOY_TYPE_PRE}）"
+      if [ "$DEPLOY_TYPE_PRE" = "kubectl" ]; then
+        export KUBECONFIG="$KUBECONFIG_PRE"
+        kubectl set image "deployment/${K8S_DEPLOYMENT_NAME}" \
+          "app=${IMAGE_TAG}" \
+          -n "${K8S_NAMESPACE_PRE}"
+        kubectl rollout status "deployment/${K8S_DEPLOYMENT_NAME}" \
+          -n "${K8S_NAMESPACE_PRE}" --timeout=5m
+
+      elif [ "$DEPLOY_TYPE_PRE" = "argocd" ]; then
+        argocd app set "${ARGOCD_APP_PRE}" --helm-set "image.tag=${CI_COMMIT_SHORT_SHA}"
+        argocd app sync "${ARGOCD_APP_PRE}" --timeout 300
+
+      elif [ "$DEPLOY_TYPE_PRE" = "docker" ]; then
+        ssh "deploy@${PRE_HOST}" \
+          "docker pull ${IMAGE_TAG} && \
+           docker-compose -f /opt/${CI_PROJECT_NAME}/docker-compose.yml up -d"
+
+      elif [ "$DEPLOY_TYPE_PRE" = "binary" ]; then
+        ssh "deploy@${PRE_HOST}" \
+          "cp ${BINARY_PATH} /opt/${CI_PROJECT_NAME}/current && \
+           systemctl restart ${CI_PROJECT_NAME}"
+      fi
+
+
+# ==============================================================================
+# ④ main 分支 — preflight 核查 + LLM 发布摘要（不部署）
+# ==============================================================================
+
+preflight:
+  stage: preflight
+  rules:
+    - if: '$CI_COMMIT_BRANCH == "main"'
+  needs: ["trivy"]
+  image: python:3.11-slim
+  script:
+    - pip install requests --quiet
+    - |
+      python3 << 'PYEOF'
+      import os, requests, sys, json
+
+      gitlab_url = os.environ["CI_SERVER_URL"]
+      project_id = os.environ["CI_PROJECT_ID"]
+      token = os.environ["GITLAB_API_TOKEN"]
+      headers = {"PRIVATE-TOKEN": token}
+      failures = []
+
+      # 1. 检查是否有未合并的 DB 迁移 MR（打了 db-migration 标签）
+      resp = requests.get(
+          f"{gitlab_url}/api/v4/projects/{project_id}/merge_requests",
+          params={"state": "opened", "labels": "db-migration"},
+          headers=headers,
+      )
+      open_db_mrs = resp.json()
+      if open_db_mrs:
+          failures.append(f"❌ 存在未合并的 DB 迁移 MR：{[mr['title'] for mr in open_db_mrs]}")
+      else:
+          print("✅ 无未合并的 DB 迁移 MR")
+
+      # 2. 获取自上次 Tag 以来的提交列表
+      tags_resp = requests.get(
+          f"{gitlab_url}/api/v4/projects/{project_id}/repository/tags",
+          params={"per_page": 1},
+          headers=headers,
+      )
+      tags = tags_resp.json()
+      last_tag = tags[0]["name"] if tags else None
+      commit_list = ""
+      if last_tag:
+          compare_resp = requests.get(
+              f"{gitlab_url}/api/v4/projects/{project_id}/repository/compare",
+              params={"from": last_tag, "to": "main"},
+              headers=headers,
+          )
+          commits = compare_resp.json().get("commits", [])
+          print(f"✅ 自 {last_tag} 以来共 {len(commits)} 个提交")
+          commit_list = "\n".join(f"- {c['short_id']} {c['title']}" for c in commits)
+          with open("commit_list.txt", "w") as f:
+              f.write(commit_list)
+      else:
+          print("⚠️ 未找到历史 Tag，跳过提交列表检查")
+          with open("commit_list.txt", "w") as f:
+              f.write("（首次发布，无历史 Tag）")
+
+      # 3. 检查最近合并到 main 的 MR 是否含回滚方案
+      mr_resp = requests.get(
+          f"{gitlab_url}/api/v4/projects/{project_id}/merge_requests",
+          params={"state": "merged", "target_branch": "main", "per_page": 5},
+          headers=headers,
+      )
+      recent_mrs = mr_resp.json()
+      has_rollback = any(
+          "rollback" in (mr.get("description") or "").lower()
+          or "rollback" in (mr.get("labels") or [])
+          for mr in recent_mrs
+      )
+      if not has_rollback:
+          failures.append("❌ 最近合并的 MR 未包含回滚方案（description 含 rollback 或打 rollback 标签）")
+      else:
+          print("✅ 回滚方案已记录")
+
+      # 4. 检查 ConfigMap 变更（约定：ConfigMap 变更的 MR 需打 configmap-change 标签）
+      has_cm_change = any("configmap-change" in (mr.get("labels") or []) for mr in recent_mrs)
+      if has_cm_change:
+          # 有 ConfigMap 变更，检查是否已同步
+          synced = any(
+              "cm-synced" in (mr.get("labels") or [])
+              for mr in recent_mrs
+              if "configmap-change" in (mr.get("labels") or [])
+          )
+          if not synced:
+              failures.append("❌ 检测到 ConfigMap 变更的 MR，但未打 cm-synced 标签确认已同步")
+          else:
+              print("✅ ConfigMap 变更已同步")
+      else:
+          print("✅ 无 ConfigMap 变更")
+
+      if failures:
+          print("\n".join(failures))
+          sys.exit(1)
+
+      print("\n✅ Preflight 全部通过，可以打 Tag 发布。")
+      PYEOF
+  artifacts:
+    paths:
+      - commit_list.txt
+    expire_in: 7 days
+
+llm-release-summary:
+  stage: preflight
+  rules:
+    - if: '$CI_COMMIT_BRANCH == "main"'
+  needs: ["preflight"]
+  image: python:3.11-slim
+  script:
+    - pip install requests --quiet
+    - |
+      python3 << 'PYEOF'
+      import os, requests, json
+
+      commit_list = ""
+      try:
+          with open("commit_list.txt") as f:
+              commit_list = f.read()
+      except FileNotFoundError:
+          commit_list = "（未找到提交列表）"
+
+      prompt = f"""你是一个技术发布经理。根据以下 Git 提交列表，生成一份发布摘要，包含：
+      1. 功能变更分类（新功能 / 优化 / Bug修复 / 依赖升级）
+      2. 破坏性变更（如有，否则写"无"）
+      3. 影响范围评估
+      4. 建议发布窗口（低风险可随时发布；高风险建议非高峰时段）
+
+      提交列表：
+      {commit_list}
+
+      用中文输出，格式清晰，控制在 500 字以内。"""
+
+      resp = requests.post(
+          os.environ["VLLM_URL"],
+          json={
+              "model": os.environ["VLLM_MODEL"],
+              "messages": [{"role": "user", "content": prompt}],
+              "temperature": 0.3,
+              "max_tokens": 1024,
+          },
+          timeout=60,
+      )
+      summary = resp.json()["choices"][0]["message"]["content"]
+
+      print("=== LLM 发布摘要 ===")
+      print(summary)
+
+      with open("release-summary.md", "w") as f:
+          f.write(f"# 发布摘要\n\n{summary}\n\n---\n\n## 本次提交列表\n\n{commit_list}\n")
+      PYEOF
+  artifacts:
+    paths:
+      - release-summary.md
+    expire_in: 30 days
+
+
+# ==============================================================================
+# ⑤ Tag v*.*.* — FTP 推送（二进制 + 离线镜像 tar）
+# ==============================================================================
+
+ftp-push:
+  stage: release
+  rules:
+    - if: '$CI_COMMIT_TAG =~ /^v\d+\.\d+\.\d+/'
+  image: docker:24
+  services:
+    - docker:24-dind
+  script:
+    - apk add --no-cache lftp
+    - docker login -u "${HARBOR_USER_PROD}" -p "${HARBOR_PASS_PROD}" "${HARBOR_URL_PROD}"
+
+    # 从 main_SHA tag 重新打 release tag + latest
+    - SHA_TAG="${IMAGE_NAME_PROD}:main_${CI_COMMIT_SHORT_SHA}"
+    - VERSIONED_TAG="${IMAGE_NAME_PROD}:release_${CI_COMMIT_TAG}"
+    - LATEST_TAG="${IMAGE_NAME_PROD}:latest"
+    - docker pull "${SHA_TAG}"
+    - docker tag "${SHA_TAG}" "${VERSIONED_TAG}"
+    - docker tag "${SHA_TAG}" "${LATEST_TAG}"
+    - docker push "${VERSIONED_TAG}"
+    - docker push "${LATEST_TAG}"
+
+    # 打包离线镜像 tar（用于无法访问 Harbor 的离线环境）
+    - docker save "${VERSIONED_TAG}" | gzip > "${CI_PROJECT_NAME}-${CI_COMMIT_TAG}.tar.gz"
+
+    # 推送离线镜像 tar 到 FTP
+    - |
+      lftp -u "${FTP_USER},${FTP_PASS}" "${FTP_HOST}" << 'FTPEOF'
+      mkdir -p /releases/${CI_PROJECT_NAME}/${CI_COMMIT_TAG}
+      put ${CI_PROJECT_NAME}-${CI_COMMIT_TAG}.tar.gz \
+          -o /releases/${CI_PROJECT_NAME}/${CI_COMMIT_TAG}/image.tar.gz
+      bye
+      FTPEOF
+
+    # 推送二进制（仅 Java / Go）
+    - |
+      if [ "$LANG_TYPE" = "java" ]; then
+        JAR=$(find target -name "*.jar" -not -name "*-sources.jar" | head -1)
+        if [ -n "$JAR" ]; then
+          lftp -u "${FTP_USER},${FTP_PASS}" "${FTP_HOST}" << FTPEOF
+          put ${JAR} -o /releases/${CI_PROJECT_NAME}/${CI_COMMIT_TAG}/app.jar
+          bye
+      FTPEOF
+        fi
+      elif [ "$LANG_TYPE" = "go" ]; then
+        BIN=$(find . -maxdepth 2 -type f -name "${CI_PROJECT_NAME}" | head -1)
+        if [ -n "$BIN" ]; then
+          lftp -u "${FTP_USER},${FTP_PASS}" "${FTP_HOST}" << FTPEOF
+          put ${BIN} -o /releases/${CI_PROJECT_NAME}/${CI_COMMIT_TAG}/${CI_PROJECT_NAME}
+          bye
+      FTPEOF
+        fi
+      fi
+
+    - echo "✅ FTP 推送完成：/releases/${CI_PROJECT_NAME}/${CI_COMMIT_TAG}/"
+
+# 发送飞书审批卡片（含 LLM 发布摘要）
+feishu-approval:
+  stage: release
+  rules:
+    - if: '$CI_COMMIT_TAG =~ /^v\d+\.\d+\.\d+/'
+  needs: ["ftp-push"]
+  image: python:3.11-slim
+  script:
+    - pip install requests --quiet
+    - |
+      python3 << 'PYEOF'
+      import os, requests
+
+      tag = os.environ["CI_COMMIT_TAG"]
+      project = os.environ["CI_PROJECT_NAME"]
+      pipeline_url = os.environ["CI_PIPELINE_URL"]
+      webhook = os.environ["FEISHU_WEBHOOK"]
+
+      summary = "（发布摘要未生成）"
+      try:
+          with open("release-summary.md") as f:
+              lines = f.readlines()
+              # 跳过标题行，取前 20 行内容
+              summary = "".join(lines[2:22]).strip()
+      except FileNotFoundError:
+          pass
+
+      card = {
+          "msg_type": "interactive",
+          "card": {
+              "header": {
+                  "title": {
+                      "tag": "plain_text",
+                      "content": f"🚀 发布审批申请：{project} {tag}"
+                  },
+                  "template": "orange"
+              },
+              "elements": [
+                  {
+                      "tag": "div",
+                      "text": {
+                          "tag": "lark_md",
+                          "content": (
+                              f"**项目**：{project}\n"
+                              f"**版本**：{tag}\n"
+                              f"**Pipeline**：{pipeline_url}"
+                          )
+                      }
+                  },
+                  {"tag": "hr"},
+                  {
+                      "tag": "div",
+                      "text": {
+                          "tag": "lark_md",
+                          "content": f"**发布摘要**：\n{summary}"
+                      }
+                  },
+                  {"tag": "hr"},
+                  {
+                      "tag": "div",
+                      "text": {
+                          "tag": "lark_md",
+                          "content": (
+                              "⬇️ 审批通过后，请在 GitLab Pipeline 中手动触发 **deploy-prod** job\n"
+                              f"[👉 前往 Pipeline]({pipeline_url})"
+                          )
+                      }
+                  }
+              ]
+          }
+      }
+
+      resp = requests.post(webhook, json=card, timeout=10)
+      print(f"飞书审批卡片发送状态：{resp.status_code}")
+      PYEOF
+
+
+# ==============================================================================
+# deploy-prod（Tag，手动触发）
+# ==============================================================================
+
+deploy-prod:
+  stage: deploy-prod
+  rules:
+    - if: '$CI_COMMIT_TAG =~ /^v\d+\.\d+\.\d+/'
+      when: manual
+  needs: ["feishu-approval"]
+  environment:
+    name: prod
+    url: "http://${CI_PROJECT_NAME}.internal"
+  script:
+    - VERSIONED_TAG="${IMAGE_NAME_PROD}:release_${CI_COMMIT_TAG}"
+    - |
+      echo "部署 ${VERSIONED_TAG} 到 prod（DEPLOY_TYPE=${DEPLOY_TYPE_PROD}）"
+      if [ "$DEPLOY_TYPE_PROD" = "kubectl" ]; then
+        export KUBECONFIG="$KUBECONFIG_PROD"
+        kubectl set image "deployment/${K8S_DEPLOYMENT_NAME}" \
+          "app=${VERSIONED_TAG}" \
+          -n "${K8S_NAMESPACE_PROD}"
+        kubectl rollout status "deployment/${K8S_DEPLOYMENT_NAME}" \
+          -n "${K8S_NAMESPACE_PROD}" --timeout=10m
+
+      elif [ "$DEPLOY_TYPE_PROD" = "argocd" ]; then
+        argocd app set "${ARGOCD_APP_PROD}" --helm-set "image.tag=${CI_COMMIT_TAG}"
+        argocd app sync "${ARGOCD_APP_PROD}" --timeout 600
+
+      elif [ "$DEPLOY_TYPE_PROD" = "docker" ]; then
+        ssh "deploy@${PROD_HOST}" \
+          "docker pull ${VERSIONED_TAG} && \
+           docker-compose -f /opt/${CI_PROJECT_NAME}/docker-compose.yml up -d"
+
+      elif [ "$DEPLOY_TYPE_PROD" = "binary" ]; then
+        ssh "deploy@${PROD_HOST}" \
+          "cp /opt/${CI_PROJECT_NAME}/current \
+              /opt/${CI_PROJECT_NAME}/releases/\$(date +%Y%m%d%H%M%S) 2>/dev/null || true && \
+           cp ${BINARY_PATH} /opt/${CI_PROJECT_NAME}/current && \
+           systemctl restart ${CI_PROJECT_NAME}"
+      fi
+
+
+# ==============================================================================
+# notify（Tag，deploy-prod 成功后：飞书上线通知 + DORA 指标上报）
+# ==============================================================================
+
+notify-deploy:
+  stage: notify
+  rules:
+    - if: '$CI_COMMIT_TAG =~ /^v\d+\.\d+\.\d+/'
+  needs: ["deploy-prod"]
+  image: python:3.11-slim
+  script:
+    - pip install requests --quiet
+    - |
+      python3 << 'PYEOF'
+      import os, requests, time
+
+      tag = os.environ["CI_COMMIT_TAG"]
+      project = os.environ["CI_PROJECT_NAME"]
+      pipeline_url = os.environ["CI_PIPELINE_URL"]
+      webhook = os.environ["FEISHU_WEBHOOK"]
+      pushgateway = os.environ["PUSHGATEWAY_URL"]
+      deploy_time = time.strftime("%Y-%m-%d %H:%M:%S")
+
+      # 飞书上线通知
+      card = {
+          "msg_type": "interactive",
+          "card": {
+              "header": {
+                  "title": {
+                      "tag": "plain_text",
+                      "content": f"✅ 上线成功：{project} {tag}"
+                  },
+                  "template": "green"
+              },
+              "elements": [
+                  {
+                      "tag": "div",
+                      "text": {
+                          "tag": "lark_md",
+                          "content": (
+                              f"**项目**：{project}\n"
+                              f"**版本**：{tag}\n"
+                              f"**上线时间**：{deploy_time}\n"
+                              f"**Pipeline**：{pipeline_url}"
+                          )
+                      }
+                  }
+              ]
+          }
+      }
+      resp = requests.post(webhook, json=card, timeout=10)
+      print(f"飞书通知发送：{resp.status_code}")
+
+      # DORA 指标上报：deployment_frequency（部署时间戳）
+      deploy_ts = int(time.time())
+      metrics = (
+          f'deployment_frequency{{project="{project}",env="prod",tag="{tag}"}} '
+          f'{deploy_ts}\n'
+      )
+      resp2 = requests.post(
+          f"{pushgateway}/metrics/job/cicd_dora/instance/{project}",
+          data=metrics,
+          timeout=10,
+      )
+      print(f"DORA 指标上报：{resp2.status_code}")
+      PYEOF
+
+
+# ==============================================================================
+# ⑥ 失败兜底（任意分支、任意阶段失败时自动触发）
+# 调 GitLab API 拉失败日志 → vLLM 分析根因 → MR/Commit 评论
+# ==============================================================================
+
+ai-failure-analysis:
+  stage: .post
+  rules:
+    - if: '$CI_COMMIT_BRANCH =~ /^feature\//'
+      when: on_failure
+    - if: '$CI_COMMIT_BRANCH == "dev"'
+      when: on_failure
+    - if: '$CI_COMMIT_BRANCH == "pre"'
+      when: on_failure
+    - if: '$CI_COMMIT_BRANCH == "main"'
+      when: on_failure
+    - if: '$CI_COMMIT_TAG =~ /^v\d+\.\d+\.\d+/'
+      when: on_failure
+  image: python:3.11-slim
+  script:
+    - pip install requests --quiet
+    - |
+      python3 << 'PYEOF'
+      import os, requests
+
+      gitlab_url = os.environ["CI_SERVER_URL"]
+      project_id = os.environ["CI_PROJECT_ID"]
+      pipeline_id = os.environ["CI_PIPELINE_ID"]
+      token = os.environ["GITLAB_API_TOKEN"]
+      headers = {"PRIVATE-TOKEN": token}
+
+      # 获取失败 job
+      jobs_resp = requests.get(
+          f"{gitlab_url}/api/v4/projects/{project_id}/pipelines/{pipeline_id}/jobs",
+          headers=headers,
+      )
+      failed_jobs = [j for j in jobs_resp.json() if j.get("status") == "failed"]
+      if not failed_jobs:
+          print("No failed jobs found.")
+          exit(0)
+
+      job = failed_jobs[0]
+      job_id = job["id"]
+      job_name = job["name"]
+
+      # 获取 job 日志，取最后 200 行
+      log_resp = requests.get(
+          f"{gitlab_url}/api/v4/projects/{project_id}/jobs/{job_id}/trace",
+          headers=headers,
+      )
+      log_tail = "\n".join(log_resp.text.splitlines()[-200:])
+
+      prompt = f"""以下是 GitLab CI job "{job_name}" 的失败日志（最后 200 行）。
+      请分析根本原因，给出：
+      1. 失败原因（1-2 句话）
+      2. 排查步骤（3 步以内）
+      3. 修复建议
+
+      日志：
+      {log_tail}
+
+      用中文回答，简洁明确。"""
+
+      resp = requests.post(
+          os.environ["VLLM_URL"],
+          json={
+              "model": os.environ["VLLM_MODEL"],
+              "messages": [{"role": "user", "content": prompt}],
+              "temperature": 0.1,
+              "max_tokens": 512,
+          },
+          timeout=60,
+      )
+      analysis = resp.json()["choices"][0]["message"]["content"]
+      comment = (
+          f"## 🤖 AI 根因分析（仅供参考）\n\n"
+          f"**失败 Job**：`{job_name}`\n\n"
+          f"{analysis}"
+      )
+
+      # 优先找关联的 MR 并评论
+      branch = os.environ.get("CI_COMMIT_BRANCH", "")
+      mr_resp = requests.get(
+          f"{gitlab_url}/api/v4/projects/{project_id}/merge_requests",
+          params={"source_branch": branch, "state": "opened"},
+          headers=headers,
+      )
+      mrs = mr_resp.json()
+      if mrs:
+          mr_iid = mrs[0]["iid"]
+          requests.post(
+              f"{gitlab_url}/api/v4/projects/{project_id}/merge_requests/{mr_iid}/notes",
+              json={"body": comment},
+              headers=headers,
+          )
+          print(f"✅ 已在 MR !{mr_iid} 发布根因分析评论")
+      else:
+          # 无 MR（如 main 分支直接 push）则评论到 commit
+          requests.post(
+              f"{gitlab_url}/api/v4/projects/{project_id}/repository/commits"
+              f"/{os.environ['CI_COMMIT_SHA']}/comments",
+              json={"note": comment},
+              headers=headers,
+          )
+          print("✅ 已在 Commit 发布根因分析评论")
+      PYEOF

@@ -1,0 +1,150 @@
+---
+# SmartVision 私有化部署 Playbook
+# 用途：在通过 Preflight 检查后，执行 SmartVision 完整部署
+# 前置条件：已执行 01-preflight-check.yml 且所有检查通过
+# 使用：ansible-playbook 02-deploy-smartvision.yml -i inventory.yml -e "version=v1.2.0"
+
+- name: SmartVision 私有化部署
+  hosts: k8s_masters
+  gather_facts: false
+  vars:
+    smartvision_version: "{{ version | default('latest') }}"
+    registry_prefix: "{{ harbor_url }}/smartvision"
+    namespace: "smartvision"
+    helm_release_name: "smartvision"
+    helm_chart_path: "../charts/smartvision"
+    kubeconfig_path: "{{ ansible_env.HOME }}/.kube/config"
+
+  tasks:
+    # ==================== 准备阶段 ====================
+    - name: "[准备] 创建命名空间"
+      shell: kubectl create namespace {{ namespace }} --dry-run=client -o yaml | kubectl apply -f -
+      changed_when: false
+
+    - name: "[准备] 创建镜像仓库 Secret"
+      shell: |
+        kubectl create secret docker-registry harbor-secret \
+          --docker-server={{ harbor_url }} \
+          --docker-username={{ harbor_username }} \
+          --docker-password={{ harbor_password }} \
+          --namespace={{ namespace }} \
+          --dry-run=client -o yaml | kubectl apply -f -
+      no_log: true  # 不记录密码到日志
+      changed_when: false
+
+    - name: "[准备] 从 inventory 生成 values.yaml"
+      template:
+        src: templates/values.yaml.j2
+        dest: /tmp/smartvision-values-{{ ansible_date_time.epoch }}.yaml
+      register: values_file
+
+    # ==================== 数据库初始化 ====================
+    - name: "[数据库] 检查 PostgreSQL 连通性"
+      shell: |
+        kubectl run --rm pg-test \
+          --image=postgres:15 \
+          --restart=Never \
+          --namespace={{ namespace }} \
+          --env="PGPASSWORD={{ db_password }}" \
+          -- pg_isready -h {{ db_host }} -U {{ db_user }} -d {{ db_name }}
+      register: pg_check
+      changed_when: false
+      retries: 3
+      delay: 10
+
+    - name: "[数据库] PostgreSQL 连接验证"
+      debug:
+        msg: "✅ PostgreSQL 连接正常: {{ db_host }}"
+
+    - name: "[数据库] 执行 DB Migration（Flyway/自定义 SQL）"
+      shell: |
+        kubectl run --rm db-migrate \
+          --image={{ registry_prefix }}/smartvision-migrate:{{ smartvision_version }} \
+          --restart=Never \
+          --namespace={{ namespace }} \
+          --env="DATABASE_URL=postgresql://{{ db_user }}:{{ db_password }}@{{ db_host }}/{{ db_name }}" \
+          --wait
+      register: migration_result
+
+    - name: "[数据库] Migration 执行结果"
+      debug:
+        msg: "DB Migration 完成: {{ migration_result.stdout_lines }}"
+
+    # ==================== 部署核心服务 ====================
+    - name: "[部署] 执行 Helm 安装/升级"
+      shell: |
+        helm upgrade --install {{ helm_release_name }} {{ helm_chart_path }} \
+          --namespace {{ namespace }} \
+          --version {{ smartvision_version }} \
+          --values /tmp/smartvision-values-{{ ansible_date_time.epoch }}.yaml \
+          --set image.tag={{ smartvision_version }} \
+          --set image.registry={{ registry_prefix }} \
+          --timeout 10m \
+          --wait \
+          --atomic
+      register: helm_result
+
+    - name: "[部署] Helm 部署结果"
+      debug:
+        msg: "{{ helm_result.stdout_lines }}"
+
+    # ==================== 部署后验证 ====================
+    - name: "[验证] 等待所有 Pod 就绪（最多 5 分钟）"
+      shell: |
+        kubectl wait --for=condition=ready pod \
+          --selector=app.kubernetes.io/instance={{ helm_release_name }} \
+          --namespace={{ namespace }} \
+          --timeout=300s
+      register: pods_ready
+
+    - name: "[验证] 检查服务健康"
+      uri:
+        url: "http://{{ item }}:{{ smartvision_port | default(8080) }}/health"
+        timeout: 10
+        return_content: true
+      register: health_check
+      retries: 5
+      delay: 15
+      until: health_check.status == 200
+      loop: "{{ smartvision_api_hosts | default(['localhost']) }}"
+      failed_when: false
+
+    - name: "[验证] API Smoke Test"
+      uri:
+        url: "http://{{ smartvision_api_hosts[0] }}:{{ smartvision_port | default(8080) }}/api/v1/ping"
+        method: GET
+        timeout: 10
+      register: ping_result
+      failed_when: ping_result.status != 200
+
+    - name: "[验证] 显示最终 Pod 状态"
+      shell: kubectl get pods -n {{ namespace }} -o wide
+      register: pod_status
+      changed_when: false
+
+    - name: "[验证] Pod 状态"
+      debug:
+        msg: "{{ pod_status.stdout_lines }}"
+
+    # ==================== 清理与报告 ====================
+    - name: "[清理] 删除临时 values 文件"
+      file:
+        path: /tmp/smartvision-values-{{ ansible_date_time.epoch }}.yaml
+        state: absent
+
+    - name: "🎉 部署完成摘要"
+      debug:
+        msg: |
+          ================================================
+          SmartVision 部署完成
+          ================================================
+          版本: {{ smartvision_version }}
+          命名空间: {{ namespace }}
+          API 地址: http://{{ smartvision_api_hosts[0] }}:{{ smartvision_port | default(8080) }}
+          部署时间: {{ ansible_date_time.iso8601 }}
+          ================================================
+          下一步：
+          1. 执行完整功能验收测试
+          2. 配置 License（参见 14-License授权）
+          3. 将环境信息填入交付验收报告
+          ================================================

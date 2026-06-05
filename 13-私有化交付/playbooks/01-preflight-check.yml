@@ -1,0 +1,147 @@
+---
+# SmartVision 私有化部署 Preflight 检查 Playbook
+# 用途：在正式部署前检查客户环境是否满足所有前置条件
+# 使用：ansible-playbook preflight-check.yml -i inventory.yml
+
+- name: SmartVision 环境 Preflight 检查
+  hosts: k8s_masters
+  gather_facts: true
+  vars:
+    min_cpu_cores: 16
+    min_memory_gb: 64
+    min_disk_gb: 500
+    required_k8s_version: "1.20"
+    required_gpu: true
+    harbor_url: "{{ registry_url | default('registry.example.com') }}"
+
+  tasks:
+    # ==================== 基础资源检查 ====================
+    - name: "[资源] 检查 CPU 核数"
+      assert:
+        that:
+          - ansible_processor_vcpus >= min_cpu_cores
+        fail_msg: "CPU 核数不足：当前 {{ ansible_processor_vcpus }} 核，需要 {{ min_cpu_cores }} 核"
+        success_msg: "✅ CPU: {{ ansible_processor_vcpus }} 核（要求 >= {{ min_cpu_cores }} 核）"
+
+    - name: "[资源] 检查内存大小"
+      assert:
+        that:
+          - ansible_memtotal_mb >= (min_memory_gb * 1024)
+        fail_msg: "内存不足：当前 {{ (ansible_memtotal_mb / 1024) | int }}GB，需要 {{ min_memory_gb }}GB"
+        success_msg: "✅ 内存: {{ (ansible_memtotal_mb / 1024) | int }}GB（要求 >= {{ min_memory_gb }}GB）"
+
+    - name: "[资源] 检查磁盘空间"
+      assert:
+        that:
+          - (item.size_total / 1024 / 1024 / 1024) | int >= min_disk_gb
+        fail_msg: "磁盘空间不足：{{ item.mount }} 当前 {{ (item.size_total / 1024 / 1024 / 1024) | int }}GB，需要 {{ min_disk_gb }}GB"
+        success_msg: "✅ 磁盘 {{ item.mount }}: {{ (item.size_total / 1024 / 1024 / 1024) | int }}GB"
+      loop: "{{ ansible_mounts | selectattr('mount', 'equalto', '/') | list }}"
+
+    # ==================== K8s 环境检查 ====================
+    - name: "[K8s] 检查 kubectl 可用"
+      command: kubectl version --client -o json
+      register: kubectl_result
+      changed_when: false
+      failed_when: kubectl_result.rc != 0
+
+    - name: "[K8s] 检查 K8s 集群版本"
+      shell: kubectl version -o json | python3 -c "import sys,json; v=json.load(sys.stdin)['serverVersion']['gitVersion']; print(v)"
+      register: k8s_version
+      changed_when: false
+
+    - name: "[K8s] 显示集群版本"
+      debug:
+        msg: "✅ K8s 版本: {{ k8s_version.stdout }}"
+
+    - name: "[K8s] 检查节点状态"
+      shell: kubectl get nodes --no-headers | awk '{print $2}' | sort -u
+      register: node_statuses
+      changed_when: false
+
+    - name: "[K8s] 确认所有节点 Ready"
+      assert:
+        that:
+          - "'NotReady' not in node_statuses.stdout"
+        fail_msg: "存在 NotReady 节点，请先修复后再部署"
+        success_msg: "✅ 所有节点状态 Ready"
+
+    - name: "[K8s] 检查 StorageClass 是否存在"
+      shell: kubectl get storageclass --no-headers | awk '{print $1}'
+      register: storage_classes
+      changed_when: false
+
+    - name: "[K8s] 显示可用 StorageClass"
+      debug:
+        msg: "可用 StorageClass: {{ storage_classes.stdout_lines }}"
+
+    - name: "[K8s] 检查是否有默认 StorageClass"
+      shell: kubectl get storageclass -o json | python3 -c "import sys,json; sc=json.load(sys.stdin)['items']; default=[s['metadata']['name'] for s in sc if s['metadata'].get('annotations',{}).get('storageclass.kubernetes.io/is-default-class')=='true']; print(default)"
+      register: default_sc
+      changed_when: false
+
+    # ==================== GPU 检查 ====================
+    - name: "[GPU] 检查 GPU 资源"
+      shell: kubectl get nodes -o json | python3 -c "import sys,json; nodes=json.load(sys.stdin)['items']; gpus=sum(int(n['status']['capacity'].get('nvidia.com/gpu',0)) for n in nodes); print(gpus)"
+      register: gpu_count
+      changed_when: false
+      when: required_gpu
+
+    - name: "[GPU] 显示 GPU 数量"
+      debug:
+        msg: "GPU 总数: {{ gpu_count.stdout }} 块"
+      when: required_gpu
+
+    - name: "[GPU] 警告：无 GPU（仅 CPU 推理模式）"
+      debug:
+        msg: "⚠️ 警告：未检测到 GPU，SmartVision 将以 CPU 推理模式运行，性能会显著下降"
+      when:
+        - required_gpu
+        - gpu_count.stdout == "0"
+
+    - name: "[GPU] 检查 GPU Operator 或 DCGM Exporter"
+      shell: kubectl get pods -n gpu-operator --no-headers 2>/dev/null | wc -l
+      register: gpu_operator_pods
+      changed_when: false
+      failed_when: false
+
+    - name: "[GPU] 显示 GPU Operator 状态"
+      debug:
+        msg: "{{ '✅ GPU Operator 已安装' if gpu_operator_pods.stdout | int > 0 else '⚠️ GPU Operator 未安装，建议安装后部署' }}"
+
+    # ==================== 网络检查 ====================
+    - name: "[网络] 检查镜像仓库连通性"
+      uri:
+        url: "https://{{ harbor_url }}/v2/"
+        validate_certs: false
+        timeout: 10
+      register: harbor_check
+      failed_when: false
+
+    - name: "[网络] 显示镜像仓库连通性"
+      debug:
+        msg: "{{ '✅ 镜像仓库可达: ' + harbor_url if harbor_check.status == 200 else '❌ 镜像仓库不可达，请检查网络或配置' }}"
+
+    - name: "[网络] 检查集群内 DNS"
+      shell: kubectl run --rm dns-test --image=busybox --restart=Never -- nslookup kubernetes.default 2>&1 | head -5
+      register: dns_check
+      changed_when: false
+      failed_when: false
+
+    # ==================== 汇总报告 ====================
+    - name: "生成 Preflight 检查摘要"
+      debug:
+        msg: |
+          ========================================
+          SmartVision Preflight 检查结果摘要
+          ========================================
+          节点信息: {{ ansible_hostname }}
+          CPU: {{ ansible_processor_vcpus }} 核
+          内存: {{ (ansible_memtotal_mb / 1024) | int }} GB
+          K8s 版本: {{ k8s_version.stdout }}
+          GPU 数量: {{ gpu_count.stdout | default('N/A') }}
+          StorageClass: {{ storage_classes.stdout_lines }}
+          镜像仓库: {{ '可达' if harbor_check.status == 200 else '不可达' }}
+          ========================================
+          如有 ❌ 项，请先解决后再执行部署 Playbook。
+          ========================================

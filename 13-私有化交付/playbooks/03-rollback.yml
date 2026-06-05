@@ -1,0 +1,121 @@
+---
+# SmartVision 版本回滚 Playbook
+# 用途：生产环境出现严重问题时，快速回滚到上一个稳定版本
+# 使用：ansible-playbook 03-rollback.yml -i inventory.yml -e "target_version=v1.1.0"
+# 注意：回滚前请确认目标版本镜像在 Harbor 中存在
+
+- name: SmartVision 版本回滚
+  hosts: k8s_masters
+  gather_facts: false
+  vars:
+    namespace: "smartvision"
+    helm_release_name: "smartvision"
+
+  pre_tasks:
+    - name: "🔴 确认回滚操作"
+      pause:
+        prompt: |
+          ================================================
+          ⚠️  回滚确认
+          ================================================
+          当前版本: {{ current_version | default('未知') }}
+          目标版本: {{ target_version | mandatory('必须指定 -e target_version=vX.X.X') }}
+          命名空间: {{ namespace }}
+          ================================================
+          确认回滚？输入 'yes' 继续，其他任何输入取消。
+      register: confirm
+
+    - name: "取消回滚"
+      fail:
+        msg: "回滚已取消"
+      when: confirm.user_input != 'yes'
+
+  tasks:
+    # ==================== 回滚前状态记录 ====================
+    - name: "[记录] 保存当前部署信息"
+      shell: |
+        helm history {{ helm_release_name }} -n {{ namespace }} --output json | \
+          python3 -c "import sys,json; h=json.load(sys.stdin); print(json.dumps(h[-1], indent=2))"
+      register: current_deploy_info
+      changed_when: false
+      failed_when: false
+
+    - name: "[记录] 当前部署信息"
+      debug:
+        msg: "当前部署: {{ current_deploy_info.stdout }}"
+
+    - name: "[记录] 保存当前 Pod 状态（用于对比）"
+      shell: kubectl get pods -n {{ namespace }} -o wide --no-headers
+      register: pre_rollback_pods
+      changed_when: false
+
+    # ==================== 执行回滚 ====================
+    - name: "[回滚] 执行 Helm 回滚到目标版本"
+      shell: |
+        helm upgrade {{ helm_release_name }} \
+          --namespace {{ namespace }} \
+          --set image.tag={{ target_version }} \
+          --reuse-values \
+          --timeout 5m \
+          --wait \
+          --atomic \
+          $(helm get values {{ helm_release_name }} -n {{ namespace }} -o yaml > /tmp/current-values.yaml && echo '--values /tmp/current-values.yaml')
+      register: rollback_result
+
+    # 或者使用 helm rollback 回到历史版本：
+    # helm rollback {{ helm_release_name }} <REVISION> -n {{ namespace }} --wait
+
+    - name: "[回滚] 回滚命令输出"
+      debug:
+        msg: "{{ rollback_result.stdout_lines }}"
+
+    # ==================== 验证回滚结果 ====================
+    - name: "[验证] 等待 Pod 就绪"
+      shell: |
+        kubectl rollout status deployment -n {{ namespace }} --timeout=180s
+      register: rollout_status
+
+    - name: "[验证] 检查服务健康"
+      uri:
+        url: "http://{{ smartvision_api_hosts[0] }}:{{ smartvision_port | default(8080) }}/health"
+        timeout: 10
+      register: health_after_rollback
+      retries: 5
+      delay: 10
+      until: health_after_rollback.status == 200
+
+    - name: "[验证] 确认版本已回滚"
+      shell: |
+        kubectl get pods -n {{ namespace }} \
+          -o jsonpath='{.items[0].spec.containers[0].image}'
+      register: current_image
+      changed_when: false
+
+    - name: "[验证] 显示当前镜像版本"
+      debug:
+        msg: "当前镜像: {{ current_image.stdout }}"
+
+    # ==================== 清理 ====================
+    - name: "[清理] 删除临时 values 文件"
+      file:
+        path: /tmp/current-values.yaml
+        state: absent
+      failed_when: false
+
+    - name: "✅ 回滚完成摘要"
+      debug:
+        msg: |
+          ================================================
+          回滚完成
+          ================================================
+          目标版本: {{ target_version }}
+          当前镜像: {{ current_image.stdout }}
+          服务健康: {{ '✅ 正常' if health_after_rollback.status == 200 else '❌ 异常' }}
+          回滚时间: {{ ansible_date_time.iso8601 }}
+          ================================================
+          后续操作：
+          1. 确认业务指标恢复正常（Grafana Dashboard）
+          2. 通知相关干系人回滚完成
+          3. 记录到故障/变更日志
+          4. 分析原版本失败原因（参见 10-SRE 故障复盘流程）
+          ================================================

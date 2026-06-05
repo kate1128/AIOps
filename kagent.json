@@ -1,0 +1,44 @@
+{
+    "name": "k8s_a2a_agent",
+    "description": "An example A2A agent that knows how to use Kubernetes tools.",
+    "url": "http://kagent-controller.kagent.svc.cluster.local:8083/api/a2a/kagent/k8s-a2a-agent/",
+    "version": "",
+    "capabilities": {
+        "streaming": true,
+        "pushNotifications": false,
+        "stateTransitionHistory": true
+    },
+    "defaultInputModes": [
+        "text"
+    ],
+    "defaultOutputModes": [
+        "text"
+    ],
+    "skills": [
+        {
+            "id": "get-resources-skill",
+            "name": "Get Resources",
+            "description": "Get resources in the Kubernetes cluster",
+            "tags": [
+                "k8s",
+                "resources"
+            ],
+            "examples": [
+                "Get all resources in the Kubernetes cluster",
+                "Get the pods in the default namespace",
+                "Get the services in the istio-system namespace",
+                "Get the deployments in the istio-system namespace",
+                "Get the jobs in the istio-system namespace",
+                "Get the cronjobs in the istio-system namespace",
+                "Get the statefulsets in the istio-system namespace"
+            ],
+            "inputModes": [
+                "text"
+            ],
+            "outputModes": [
+                "text"
+            ]
+        }
+    ],
+    "preferredTransport": "JSONRPC"
+}

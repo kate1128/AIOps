@@ -1,0 +1,49 @@
+# Ansible Inventory 配置说明
+# 用途：私有化部署时的客户环境变量配置模板
+# 使用前：复制本文件为 inventory-{客户名}.yml，填写客户实际配置
+
+all:
+  vars:
+    # ===== 镜像仓库 =====
+    harbor_url: "harbor.client.internal"          # 客户内网 Harbor 地址
+    harbor_username: "smartvision-deploy"
+    harbor_password: "CHANGE_ME_HARBOR_PASSWORD"  # 敏感值，请使用 ansible-vault 加密
+
+    # ===== K8s 配置 =====
+    namespace: "smartvision"
+    smartvision_port: 8080
+
+    # ===== 数据库 =====
+    db_host: "postgresql.prod.svc.cluster.local"
+    db_user: "smartvision"
+    db_password: "CHANGE_ME_DB_PASSWORD"          # 敏感值，请使用 ansible-vault 加密
+    db_name: "smartvision"
+
+    # ===== Redis =====
+    redis_host: "redis.prod.svc.cluster.local"
+    redis_port: 6379
+    redis_password: "CHANGE_ME_REDIS_PASSWORD"
+
+    # ===== MinIO / 对象存储 =====
+    minio_endpoint: "http://minio.prod.svc.cluster.local:9000"
+    minio_access_key: "minio-admin"
+    minio_secret_key: "CHANGE_ME_MINIO_SECRET"
+
+    # ===== SmartVision API 访问地址 =====
+    smartvision_api_hosts:
+      - "smartvision-api.prod.svc.cluster.local"
+
+  children:
+    k8s_masters:
+      hosts:
+        master-01:
+          ansible_host: 10.0.0.10          # 替换为客户 K8s Master 节点 IP
+          ansible_user: ubuntu
+          ansible_ssh_private_key_file: ~/.ssh/client_key
+
+# ==========================================================
+# 敏感变量加密说明：
+#   ansible-vault encrypt_string 'your_password' --name 'db_password'
+# 执行时解密：
+#   ansible-playbook deploy.yml -i inventory.yml --ask-vault-pass
+# ==========================================================

@@ -1,0 +1,81 @@
+# 💾 1. 自动绑定您之前全线变绿、完美 Running 的 local-path 存储驱动
+prometheus:
+  prometheusSpec:
+    storageSpec:
+      volumeClaimTemplate:
+        spec:
+          storageClassName: "local-path" 
+          accessModes: ["ReadWriteOnce"]
+          resources:
+            requests:
+              storage: 10Gi
+  service:
+    type: NodePort
+    port: 32607
+
+# 📊 2. 挂载 Grafana 数据卷并对齐国内镜像名字
+grafana:
+  persistence:
+    enabled: true
+    storageClassName: "local-path"
+    size: 5Gi
+  # 🌟🌟 核心修复参数：彻底关闭导致报错卡死的 initChownData 初始化容器 🌟🌟
+  initChownData:
+    enabled: false
+  # 🌟🌟 辅助安全修复：确保 Grafana 进程不使用非特权高难度 ID 去强行读写本地卷
+  securityContext: {}
+  podSecurityContext: {}
+  service:
+    type: NodePort
+    port: 31204
+# 🚨 3. 挂载 Alertmanager 告警卷，并配置稳定的 PrometheusAlert 飞书路由
+alertmanager:
+  enabled: true
+  alertmanagerSpec:
+    volumeClaimTemplate:
+      spec:
+        storageClassName: "local-path"
+        accessModes: ["ReadWriteOnce"]
+        resources:
+          requests:
+            storage: 2Gi     
+  config:
+    global:
+      resolve_timeout: 5m
+    route:
+      group_by: ['alertname', 'namespace']
+      group_wait: 10m
+      group_interval: 5s
+      repeat_interval: 10m
+      receiver: 'web.hook.prometheusalert'
+      routes:
+      - matchers:
+        - alertname = "Watchdog"
+        receiver: 'web.hook.prometheusalert'   # ← 修复：指向真实 receiver，不再用 "null"
+    receivers:
+    - name: 'web.hook.prometheusalert'
+      webhook_configs:
+      - url: 'http://prometheus-alert-center.default.svc.cluster.local:8080/prometheusalert?type=fs&prometheus-fs&fsurl=https://open.feishu.cn/open-apis/bot/v2/hook/90f43268-45ff-4016-8a0f-8ab52898b89c'
+    inhibit_rules:
+    - equal:
+      - namespace
+      - alertname
+      source_matchers:
+      - severity = critical
+      target_matchers:
+      - severity =~ warning|info
+    - equal:
+      - namespace
+      - alertname
+      source_matchers:
+      - severity = warning
+      target_matchers:
+      - severity = info
+    - equal:
+      - namespace
+      source_matchers:
+      - alertname = InfoInhibitor
+      target_matchers:
+      - severity = info
+    - target_matchers:
+      - alertname = InfoInhibitor

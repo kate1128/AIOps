@@ -1,0 +1,322 @@
+# =============================================================================
+# 问学 2.0 — 制品构建与归档模板
+# =============================================================================
+# 覆盖：Docker 镜像构建 / JAR 包构建 / Helm Chart 打包 / 制品推送 Harbor /
+#        Trivy 扫描 / Cosign 签名 / Syft SBOM / MinIO 自动归档
+#
+# 引入方式（在项目 .gitlab-ci.yml 中 include）：
+#   include:
+#     - project: 'smartvision/ci-templates'
+#       file: '/templates/artifact-build.gitlab-ci.yml'
+#
+# 或直接 copy 本文件内容合并到项目 .gitlab-ci.yml
+# =============================================================================
+
+stages:
+  - build
+  - sign
+  - archive
+
+# -----------------------------------------------------------------------------
+# 全局变量 — 按项目修改
+# -----------------------------------------------------------------------------
+variables:
+  HARBOR_URL: harbor.internal
+  IMAGE_NAME: $HARBOR_URL/platform/$CI_PROJECT_NAME
+  # 制品类型：docker | jar | helm（只保留一个）
+  ARTIFACT_TYPE: docker
+  # JAR 场景：Maven 模块名（target/<MODULE>.jar）
+  MAVEN_MODULE: $CI_PROJECT_NAME
+  # Helm 场景：chart 目录
+  HELM_CHART_DIR: ./chart
+
+# =============================================================================
+# Docker 镜像构建与推送
+# =============================================================================
+build-docker:
+  stage: build
+  image: docker:26
+  services:
+    - docker:26-dind
+  variables:
+    DOCKER_BUILDKIT: "1"
+  script:
+    - docker login $HARBOR_URL -u $HARBOR_USER -p $HARBOR_PASS
+
+    # 确定镜像 Tag
+    - |
+      if [ -n "$CI_COMMIT_TAG" ]; then
+        export IMG_TAG=$CI_COMMIT_TAG           # 正式版：v1.2.3
+      elif [ "$CI_COMMIT_BRANCH" = "main" ]; then
+        export IMG_TAG=rc-$CI_COMMIT_SHORT_SHA  # 预发版：rc-abc1234
+      else
+        export IMG_TAG=dev-$CI_COMMIT_SHORT_SHA # 开发版：dev-abc1234
+      fi
+      echo "IMG_TAG=$IMG_TAG" >> build.env
+
+    # 利用上一次 dev-latest 做层缓存
+    - docker pull $IMAGE_NAME:dev-latest 2>/dev/null || true
+    - |
+      docker build \
+        --cache-from $IMAGE_NAME:dev-latest \
+        --label "git.commit=$CI_COMMIT_SHA" \
+        --label "git.branch=$CI_COMMIT_BRANCH" \
+        --label "build.date=$(date -u +%Y-%m-%dT%H:%M:%SZ)" \
+        -t $IMAGE_NAME:$IMG_TAG \
+        -t $IMAGE_NAME:dev-latest \
+        .
+
+    # 推送镜像
+    - docker push $IMAGE_NAME:$IMG_TAG
+    - docker push $IMAGE_NAME:dev-latest
+
+    # 输出镜像摘要（供后续 Cosign 签名用）
+    - docker inspect --format='{{index .RepoDigests 0}}' $IMAGE_NAME:$IMG_TAG | tee image-digest.txt
+
+  artifacts:
+    reports:
+      dotenv: build.env      # 传递 IMG_TAG 给后续 Job
+    paths:
+      - image-digest.txt
+    expire_in: 1 day
+  rules:
+    - if: $CI_COMMIT_BRANCH =~ /^(dev|main)$/
+      when: on_success
+    - if: $CI_COMMIT_TAG
+      when: on_success
+
+# =============================================================================
+# JAR 包构建与推送（Java 二进制服务）
+# =============================================================================
+build-jar:
+  stage: build
+  image: maven:3.9-eclipse-temurin-17
+  script:
+    - mvn clean package -DskipTests -q
+    - JAR_FILE=$(ls target/*.jar | grep -v 'original' | head -1)
+    - JAR_NAME=$(basename $JAR_FILE)
+
+    # 确定版本号
+    - |
+      if [ -n "$CI_COMMIT_TAG" ]; then
+        export JAR_VERSION=$CI_COMMIT_TAG
+      else
+        export JAR_VERSION=dev-$CI_COMMIT_SHORT_SHA
+      fi
+      echo "JAR_VERSION=$JAR_VERSION" >> build.env
+      echo "JAR_FILE=$JAR_FILE" >> build.env
+
+    # 使用 oras 将 JAR 推送到 Harbor OCI Artifact
+    - |
+      curl -sL https://github.com/oras-project/oras/releases/download/v1.1.0/oras_1.1.0_linux_amd64.tar.gz \
+        | tar xz oras
+      ./oras push $HARBOR_URL/platform/$CI_PROJECT_NAME:$JAR_VERSION \
+        $JAR_FILE:application/java-archive \
+        --username $HARBOR_USER --password $HARBOR_PASS
+
+  artifacts:
+    reports:
+      dotenv: build.env
+    paths:
+      - target/*.jar
+    expire_in: 7 days
+  cache:
+    key: maven-$CI_PROJECT_NAME
+    paths:
+      - .m2/repository
+  rules:
+    - if: $CI_COMMIT_BRANCH =~ /^(dev|main)$/
+    - if: $CI_COMMIT_TAG
+
+# =============================================================================
+# Helm Chart 打包与推送
+# =============================================================================
+build-helm:
+  stage: build
+  image: alpine/helm:3.14
+  script:
+    - |
+      # 1. 确定版本号
+      if [ -n "$CI_COMMIT_TAG" ]; then
+        CHART_VERSION=$CI_COMMIT_TAG
+      else
+        CHART_VERSION=0.0.0-dev-$CI_COMMIT_SHORT_SHA
+      fi
+
+      # 2. 更新 Chart.yaml 中的版本号（注意这里保留了前面的缩进）
+      sed -i "s/^version:.*/version: $CHART_VERSION/" $HELM_CHART_DIR/Chart.yaml
+      sed -i "s/^appVersion:.*/appVersion: \"$CHART_VERSION\"/" $HELM_CHART_DIR/Chart.yaml
+
+      # 3. 打包
+      helm package $HELM_CHART_DIR --destination ./dist
+
+      # 4. 推送到 Harbor OCI Helm 仓库
+      helm registry login $HARBOR_URL -u $HARBOR_USER -p $HARBOR_PASS
+      helm push dist/*.tgz oci://$HARBOR_URL/helm
+
+  artifacts:
+    paths:
+      - dist/*.tgz
+    expire_in: 7 days
+  rules:
+    - if: $CI_COMMIT_BRANCH == "main"
+    - if: $CI_COMMIT_TAG
+
+
+# =============================================================================
+# 安全扫描 — Trivy（高危/严重漏洞阻断）
+# =============================================================================
+trivy-scan:
+  stage: build   # 与 build 同 stage，build 完立即扫
+  image:
+    name: aquasec/trivy:latest
+    entrypoint: [""]
+  needs: [build-docker]
+  script:
+    # 扫描并输出 SARIF 报告（GitLab Security 面板可读取）
+    - |
+      trivy image \
+        --exit-code 1 \
+        --severity HIGH,CRITICAL \
+        --ignore-unfixed \
+        --format sarif \
+        --output trivy-results.sarif \
+        $IMAGE_NAME:dev-latest
+  artifacts:
+    reports:
+      sast: trivy-results.sarif
+    expire_in: 7 days
+  allow_failure: false
+  rules:
+    - if: $CI_COMMIT_BRANCH =~ /^(dev|main)$/
+    - if: $CI_COMMIT_TAG
+
+# =============================================================================
+# Cosign 镜像签名（仅正式发布 Tag）
+# =============================================================================
+cosign-sign:
+  stage: sign
+  image:
+    name: gcr.io/projectsigstore/cosign:latest
+    entrypoint: [""]
+  needs: [build-docker, trivy-scan]
+  script:
+    - IMG_DIGEST=$(cat image-digest.txt)
+    # 使用 KMS 密钥签名（替换为实际 KMS URI）
+    # 短期替代方案：使用 GitLab Protected Variable 存储 COSIGN_PRIVATE_KEY
+    - |
+      if [ -n "$COSIGN_PRIVATE_KEY" ]; then
+        echo "$COSIGN_PRIVATE_KEY" > /tmp/cosign.key
+        cosign sign --key /tmp/cosign.key $IMG_DIGEST
+        rm /tmp/cosign.key
+      else
+        echo "⚠️  COSIGN_PRIVATE_KEY 未配置，跳过签名"
+      fi
+  rules:
+    - if: $CI_COMMIT_TAG   # 仅正式版本签名
+
+# =============================================================================
+# Syft — SBOM 生成
+# =============================================================================
+syft-sbom:
+  stage: sign
+  image:
+    name: anchore/syft:latest
+    entrypoint: [""]
+  needs: [build-docker]
+  script:
+    - syft $IMAGE_NAME:$IMG_TAG -o cyclonedx-json > sbom.json
+    - syft $IMAGE_NAME:$IMG_TAG -o spdx-json > sbom-spdx.json
+    - echo "SBOM 依赖组件数：$(jq '.components | length' sbom.json)"
+  artifacts:
+    paths:
+      - sbom.json
+      - sbom-spdx.json
+    expire_in: 90 days
+  rules:
+    - if: $CI_COMMIT_BRANCH == "main"
+    - if: $CI_COMMIT_TAG
+
+# =============================================================================
+# MinIO 自动归档（仅 Git Tag 触发正式版本）
+# =============================================================================
+archive-to-minio:
+  stage: archive
+  image: minio/mc:latest
+  needs: [build-docker, syft-sbom]
+  variables:
+    ARCHIVE_BUCKET: smartvision-archive
+  script:
+    # 配置 mc 客户端
+    - mc alias set minio $MINIO_ENDPOINT $MINIO_ACCESS_KEY $MINIO_SECRET_KEY
+
+    # 1. 导出 Docker 镜像为 tar
+    - docker login $HARBOR_URL -u $HARBOR_USER -p $HARBOR_PASS
+    - docker pull $IMAGE_NAME:$CI_COMMIT_TAG
+    - docker save $IMAGE_NAME:$CI_COMMIT_TAG -o ${CI_PROJECT_NAME}-${CI_COMMIT_TAG}.tar
+
+    # 2. 生成校验和
+    - sha256sum ${CI_PROJECT_NAME}-${CI_COMMIT_TAG}.tar > checksums.sha256
+
+    # 3. 生成 manifest.json（制品清单）
+    - |
+      cat > manifest.json << EOF
+      {
+        "service": "$CI_PROJECT_NAME",
+        "version": "$CI_COMMIT_TAG",
+        "commit": "$CI_COMMIT_SHA",
+        "build_date": "$(date -u +%Y-%m-%dT%H:%M:%SZ)",
+        "pipeline_url": "$CI_PIPELINE_URL",
+        "image": "$IMAGE_NAME:$CI_COMMIT_TAG",
+        "image_digest": "$(cat image-digest.txt)"
+      }
+      EOF
+
+    # 4. 上传全部文件到 MinIO
+    - DEST=$ARCHIVE_BUCKET/$CI_PROJECT_NAME/$CI_COMMIT_TAG/
+    - mc cp ${CI_PROJECT_NAME}-${CI_COMMIT_TAG}.tar minio/$DEST
+    - mc cp checksums.sha256 minio/$DEST
+    - mc cp sbom.json minio/$DEST
+    - mc cp sbom-spdx.json minio/$DEST
+    - mc cp manifest.json minio/$DEST
+
+    - echo "✅ 归档完成：minio/$DEST"
+    - mc ls minio/$DEST
+
+  rules:
+    - if: $CI_COMMIT_TAG   # 仅 Git Tag 触发归档
+
+# =============================================================================
+# 部署制品打包（Docker Compose / docker-run.sh 场景）
+# 将部署脚本与镜像 Tag 绑定，版本化归档
+# =============================================================================
+package-deploy-scripts:
+  stage: archive
+  image: alpine:latest
+  needs: [build-docker]
+  script:
+    - |
+      if [ -n "$CI_COMMIT_TAG" ]; then
+        VERSION=$CI_COMMIT_TAG
+      else
+        VERSION=dev-$CI_COMMIT_SHORT_SHA
+      fi
+
+    # 注入版本号到部署脚本
+    - |
+      if [ -d deploy/ ]; then
+        sed -i "s|\${VERSION}|$VERSION|g" deploy/*
+        sed -i "s|\${HARBOR_URL}|$HARBOR_URL|g" deploy/*
+        tar czf deploy-scripts-${VERSION}.tar.gz -C deploy .
+        echo "✅ 部署制品打包：deploy-scripts-${VERSION}.tar.gz"
+      else
+        echo "⚠️  deploy/ 目录不存在，跳过部署脚本打包"
+      fi
+
+  artifacts:
+    paths:
+      - deploy-scripts-*.tar.gz
+    expire_in: 90 days
+  rules:
+    - if: $CI_COMMIT_BRANCH =~ /^(dev|main)$/
+    - if: $CI_COMMIT_TAG
