@@ -1,6 +1,7 @@
 ﻿# Sandbox 可观测性
 
 > Sandbox（gVisor / RunC）运行在容器底层，指标通过容器运行时接口和节点级监控覆盖。
+> langgenius/dify-sandbox:0.2.1
 
 ---
 
