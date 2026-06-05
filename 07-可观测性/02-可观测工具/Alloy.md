@@ -385,7 +385,7 @@ Alloy Web UI 顶部导航有三个主要入口，对应三个不同视角：
 
 点击某个组件（如 `loki.source.kubernetes.pods`）可查看该组件当前的运行状态和已处理的日志流数量：
 
-![alt text](image-1.png)
+![Alloy Component](Alloy-Component.png)
 
 #### Graph（采集管道拓扑图）
 

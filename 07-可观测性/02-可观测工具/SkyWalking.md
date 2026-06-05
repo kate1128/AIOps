@@ -197,6 +197,9 @@ helm upgrade --install skywalking skywalking/skywalking \
   --values sw-values.yaml
 ```
 
+页面：
+![alt text](image.png)
+
 ### 5.2 Java Agent 注入（K8s Sidecar 方式）
 
 ```yaml
