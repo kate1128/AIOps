@@ -225,7 +225,7 @@ deployment.apps/streamablehttp-fetch-deployment   1/1     1            1        
 ```bash
 kubectl -n kagent port-forward svc/kagent-ui 8080:8080
 ```
-![alt text](image-2.png)
+![alt text](images/image-2.png)
 
 ### 5.2 配置 LLM Provider（ModelConfig CRD）
 参考阿里云这篇：
@@ -397,7 +397,7 @@ EOF
 ```
 
 获取pod状态，running即可
-![alt text](image-1.png)
+![alt text](images/image-1.png)
 
 然后把kagent-ui的service暴露出来，访问UI界面与Agent对话：
 
@@ -406,7 +406,7 @@ kagent-ui                                        NodePort    10.1.148.232   <non
 # 访问 http://localhost:32637
 ```
 
-![alt text](image-4.png)
+![alt text](images/image-4.png)
 
 #### 运维Agent 示例(未测试)
 

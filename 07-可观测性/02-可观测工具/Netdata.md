@@ -236,7 +236,7 @@ Netdata 有两种访问入口，Tab 组成不同：
 | **Add alert silencing rules** | 静默该节点告警 | 需 Community+ |
 
 
-![alt text](image-20.png)
+![alt text](images/image-20.png)
 
 #### 5.2.2 Metrics Tab — 实时指标图表
 
@@ -253,7 +253,7 @@ Netdata 有两种访问入口，Tab 组成不同：
 | snmp | SNMP 采集的网络设备指标（如已配置）|
 | cgroup | 每个 cgroup 的资源隔离指标 |
 
-![alt text](image-12.png)
+![alt text](images/image-12.png)
 
 **能配置什么：**
 - 每张图表支持 NIDL 框架过滤：按 Node / Instance / Dimension / Label 筛选数据
@@ -287,7 +287,7 @@ Tab 分为两个子页面：
 
 **② Alert Configurations（告警配置列表）：** 展示所有正在运行的告警规则（仅匹配到当前采集指标的规则才显示）。
 
-![alt text](image-16.png)
+![alt text](images/image-16.png)
 
 **能配置什么（免费 / 付费分层）：**
 
@@ -316,7 +316,7 @@ Anomaly Advisor 基于 Agent 本地 ML（每个指标独立训练模型，零配
 
 **使用流程：** 高亮时间范围 → 右侧出现按异常率排序的指标索引 → 点击跳转对应图表 → 图表顶部紫色 Anomaly Rate ribbon 显示细粒度异常情况。
 
-![alt text](image-18.png)
+![alt text](images/image-18.png)
 
 **能配置什么：** 无需配置，ML 引擎全自动运行。可在节点过滤器中限定分析范围（缩小到特定节点再高亮，排名精度更高）。
 
@@ -338,7 +338,7 @@ Anomaly Advisor 基于 Agent 本地 ML（每个指标独立训练模型，零配
 
 **配置效果 / 典型用法：** 某个指标在某时刻突变时，在 Events Tab 查看同期是否有节点重启（Topology event）或告警触发（Alert event），从而关联根因。相比 Grafana 的 Annotations，Events 是全自动记录，无需主动写入。
 
-![alt text](image-17.png)
+![alt text](images/image-17.png)
 
 #### 5.2.6 Dashboards Tab — 自定义仪表盘
 
@@ -351,7 +351,7 @@ Anomaly Advisor 基于 Agent 本地 ML（每个指标独立训练模型，零配
 
 **配置效果：** 把常用的几张图表固定在一起，不需要每次重新从 Metrics Tab 逐一查找。功能比 Grafana Dashboard 简单，但零配置可用。
 
-![alt text](image-15.png)
+![alt text](images/image-15.png)
 
 ---
 
@@ -379,7 +379,7 @@ Anomaly Advisor 基于 Agent 本地 ML（每个指标独立训练模型，零配
 
 **配置效果：** 相当于一个安全的远程诊断终端，无需 SSH 到节点即可查看实时进程状态、当前慢查询、网络连接，适合临时排查问题。
 
-![alt text](image-13.png)
+![alt text](images/image-13.png)
 
 ---
 
@@ -404,7 +404,7 @@ Anomaly Advisor 基于 Agent 本地 ML（每个指标独立训练模型，零配
 
 **配置效果：** 在同一界面内关联指标图表和对应时间段的日志，无需切换到 Kibana 或 Loki（但功能比 Loki + Grafana 弱，无标签化查询，不适合大规模日志分析）。
 
-![alt text](image-14.png)
+![alt text](images/image-14.png)
 
 ---
 
@@ -441,7 +441,7 @@ Anomaly Advisor 基于 Agent 本地 ML（每个指标独立训练模型，零配
 | **RBAC 权限控制** | Admin / Manager / Troubleshooter / Observer 角色 | 团队多人协作时限制操作权限 |
 | **Mobile App 推送** | 通过 Netdata App 接收告警推送 | 替代 Email/Slack 通知 |
 
-![alt text](image-19.png)
+![alt text](images/image-19.png)
 
 > **对本项目的判断：** 以上付费功能与已有的 Prometheus + Alertmanager + PrometheusAlert（飞书）+ Grafana 体系功能重叠，且 Netdata Cloud 为 SaaS，数据主权有限。不建议采购付费计划。
 

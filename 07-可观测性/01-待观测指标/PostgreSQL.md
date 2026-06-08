@@ -90,3 +90,56 @@ spec:
 | 托管 RDS | 一般云厂商已暴露 Prometheus 端点，直接配置 scrape |
 
 默认 postgres_exporter 不开启自动发现数据库，如需监控多个库需在启动时加 `--extend.query-path` 指定自定义查询文件。
+
+---
+
+## 采集器方案对比
+
+| 采集器 | 部署方式 | 指标覆盖 | 日志支持 | 适用场景 |
+|--------|---------|---------|---------|---------|
+| postgres_exporter | 容器/二进制 | pg_stat_* 视图全量 | 无 | Prometheus 标准方案 |
+| Grafana Alloy | 需 postgres_exporter | 通过 prometheus.scrape 抓 exporter | 内置 loki.source | Grafana 全栈 |
+| Netdata | 一键安装 | 内置 postgres collector | 内置日志查看 | 快速部署 |
+| pg_stat_statements | PostgreSQL 扩展 | 查询级性能分析 | 无 | 深度 SQL 调优 |
+
+---
+
+## Alloy 采集配置
+
+```alloy
+prometheus.scrape "postgresql" {
+  targets = [{ __address__ = "postgres-exporter.db.svc:9187", service = "postgresql" }]
+  forward_to = [prometheus.remote_write.central.receiver]
+}
+
+prometheus.remote_write "central" {
+  endpoint { url = "http://prometheus.observability.svc:9090/api/v1/write" }
+}
+```
+
+---
+
+## Netdata 方案
+
+Netdata 内置 postgres collector，自动连接 PostgreSQL 采集指标：
+
+```bash
+docker run -d --name=netdata \
+  -p 19999:19999 \
+  --cap-add SYS_PTRACE \
+  netdata/netdata
+```
+
+自动采集：连接数、缓存命中率、事务提交/回滚、复制延迟、全表扫描等。无需额外部署 postgres_exporter。
+
+---
+
+## 方案对比
+
+| 维度 | postgres_exporter + Prometheus | Alloy | Netdata |
+|------|------------------------------|-------|---------|
+| 部署复杂度 | 中 | 中 | 低 |
+| 指标精度 | 15s | 10s | 1s |
+| 多库支持 | 需 `--extend.query-path` | 需多 exporter 实例 | 自动发现 |
+| Grafana 兼容 | ⭐⭐⭐⭐⭐ | ⭐⭐⭐⭐⭐ | ⭐⭐⭐ |
+| 推荐场景 | 已有 Prometheus 栈 | Grafana 全栈 | 快速验证 |

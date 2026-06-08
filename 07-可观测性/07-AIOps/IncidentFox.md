@@ -455,7 +455,7 @@ metrics 访问：http://localhost:8080/metrics
 api文档访问：http://localhost:8080/docs#/
 
 
-![alt text](image.png)
+![alt text](images/image.png)
 
 ### 7.2 集成 Slack
 

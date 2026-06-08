@@ -527,7 +527,7 @@ spec:
 
 WebUI
 登录默认用户名/密码为 `prometheusalert/prometheusalert`，登录后可在**告警模板**页面查看和编辑内置的 `prometheus-fs` 飞书模板，修改后无需重启，立即生效。
-![alt text](image-11.png)
+![alt text](images/image-11.png)
 
 ### 6.2 已部署状态
 
@@ -593,7 +593,7 @@ curl -X POST 'http://8.140.244.244:32033/prometheusalert?type=fs&tpl=prometheus-
 ```
 
 飞书群收到卡片消息则验证通过，如下图：
-![alt text](image-8.png)
+![alt text](images/image-8.png)
 
 
 ---
@@ -705,7 +705,7 @@ bug清单里有该报错，但无人解决:
 ```bash
 "{\"code\":11246,\"data\":{},\"msg\":\"ErrCode: 100290; ErrMsg: there is an invalid user resource (at/person) in your card; ErrorValue: 2********@******; \"}"
 ```
-![alt text](image-10.png)
+![alt text](images/image-10.png)
 
 ### 用 SQLite 的缺陷是什么，页面查不到告警历史
 

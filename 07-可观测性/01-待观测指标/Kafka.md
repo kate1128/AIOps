@@ -102,3 +102,68 @@ KAFKA_OPTS="-javaagent:/opt/jmx_exporter/jmx_prometheus_javaagent.jar=9999:/opt/
 | Confluent Operator | 已内置 Prometheus metrics endpoint |
 
 Kafka 是 Java 进程，JMX Exporter 会采集 JVM 指标（GC、内存、线程），这些对排查性能问题非常关键。
+
+---
+
+## 采集器方案对比
+
+| 采集器 | 部署方式 | 指标覆盖 | 日志支持 | 适用场景 |
+|--------|---------|---------|---------|---------|
+| JMX Exporter | 嵌入 Kafka 进程 | Broker + JVM 全量 | 无 | 标准方案（需改启动参数） |
+| kafka-exporter | 独立容器 | Consumer Lag 专项 | 无 | 只关注消费延迟 |
+| JMX + kafka-exporter | 组合 | 全量覆盖 | 无 | 生产推荐 |
+| Grafana Alloy | 抓取 exporter 端口 | 同上 | 内置 loki.source | Grafana 全栈 |
+| Netdata | 一键安装 | 内置 kafka collector | 内置日志查看 | 快速部署 |
+
+---
+
+## Alloy 采集配置
+
+```alloy
+// JMX Exporter 指标
+prometheus.scrape "kafka_jmx" {
+  targets = [
+    { __address__ = "kafka-1:9999", service = "kafka-jmx" },
+    { __address__ = "kafka-2:9999", service = "kafka-jmx" },
+    { __address__ = "kafka-3:9999", service = "kafka-jmx" },
+  ]
+  forward_to = [prometheus.remote_write.central.receiver]
+}
+
+// kafka-exporter（Consumer Lag）
+prometheus.scrape "kafka_exporter" {
+  targets = [{ __address__ = "kafka-exporter:9308", service = "kafka-consumer" }]
+  forward_to = [prometheus.remote_write.central.receiver]
+}
+
+prometheus.remote_write "central" {
+  endpoint { url = "http://prometheus.observability.svc:9090/api/v1/write" }
+}
+```
+
+---
+
+## Netdata 方案
+
+Netdata 内置 kafka collector，但需要 JMX 端口可达：
+
+```bash
+docker run -d --name=netdata \
+  -p 19999:19999 \
+  --cap-add SYS_PTRACE \
+  netdata/netdata
+```
+
+> 注意：Kafka 的 JMX Agent 必须嵌入进程（`-javaagent`），这是所有方案的共同前提，Netdata 也不例外。
+
+---
+
+## 方案对比
+
+| 维度 | JMX Exporter + Prometheus | Alloy | Netdata |
+|------|--------------------------|-------|---------|
+| 部署复杂度 | 高（需改 Kafka 启动参数） | 高（同左 + Alloy） | 中 |
+| Kafka 侧改动 | 必须加 `-javaagent` | 必须加 `-javaagent` | 必须加 `-javaagent` |
+| Consumer Lag | 需额外 kafka-exporter | 同左 | 内置 |
+| JVM 指标 | ✅ | ✅ | ✅ |
+| 推荐场景 | 标准方案 | Grafana 全栈 | 快速验证 |

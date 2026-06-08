@@ -222,7 +222,7 @@ loki.write "default" {
 }
 ```
 
-![alt text](image.png)
+![alt text](images/image.png)
 
 ### 7.3 Loki 多租户管理
 
@@ -453,7 +453,7 @@ Org 2（测试团队）
 3. 在该 Org 内单独配置数据源、导入 Dashboard、添加用户
 4. 同一个用户可以属于多个 Org，每次切换 Org 后看到的是完全独立的工作空间
 
-![alt text](image-1.png)
+![alt text](images/image-1.png)
 
 ### 8.6 与 Loki 租户配合使用
 
@@ -491,17 +491,17 @@ Grafana Org 2（测试团队）
 ### 实操
 
 1. 创建组织
-![alt text](image-5.png)
+![alt text](images/image-5.png)
 
 2. 创建用户
 一个用户能加入多个组织
-![alt text](image-2.png)
+![alt text](images/image-2.png)
 
 2. 创建team
-![alt text](image-6.png)
+![alt text](images/image-6.png)
 
 3. 创建sa
-![alt text](image-7.png)
+![alt text](images/image-7.png)
 ---
 
 ## 9. 仪表盘管理

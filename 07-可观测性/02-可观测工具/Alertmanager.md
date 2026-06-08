@@ -155,7 +155,7 @@ open http://localhost:9093
 ```
 
 在 UI 中可查看：当前活跃告警、已分组状态、静默规则列表、抑制规则。
-![alt text](image-9.png)
+![alt text](images/image-9.png)
 
 ### 6.2 验证告警链路
 

@@ -99,3 +99,54 @@ runsc --platform=kvm \
 | Docker + gVisor | 不常用，建议 K8s 统一管理 |
 
 gVisor 的 Sentry 级指标（runsc_*）默认不启用，需在 containerd 配置中转递 `--metrics-server` 参数才能采集。
+
+---
+
+## 采集器方案对比
+
+| 采集器 | 部署方式 | 指标覆盖 | 日志支持 | 适用场景 |
+|--------|---------|---------|---------|---------|
+| cAdvisor | 容器化 | 容器级 CPU/内存/网络/磁盘 | 无 | RunC 容器标准方案 |
+| gVisor sentry metrics | 启动参数启用 | Sentry 进程级 Go 指标 | 无 | gVisor 专项 |
+| cAdvisor + gVisor sentry | 组合 | 全量覆盖 | 无 | gVisor 生产推荐 |
+| Grafana Alloy | 抓取 exporter 端口 | 同上 | 内置 loki.source | Grafana 全栈 |
+| Netdata | 一键安装 | 内置 cgroup + 系统指标 | 内置日志查看 | 快速部署 |
+
+---
+
+## Alloy 采集配置
+
+```alloy
+// gVisor Sentry 指标
+prometheus.scrape "gvisor" {
+  targets = [{ __address__ = "sandbox-node:9001", service = "gvisor-sentry" }]
+  forward_to = [prometheus.remote_write.central.receiver]
+}
+
+// cAdvisor 容器级指标（过滤 Sandbox Pod）
+prometheus.scrape "cadvisor_sandbox" {
+  targets = [{ __address__ = "node:8080", service = "sandbox-container" }]
+  metric_relabel_configs {
+    source_labels = ["pod"]
+    regex         = ".*sandbox.*"
+    action        = "keep"
+  }
+  forward_to = [prometheus.remote_write.central.receiver]
+}
+
+prometheus.remote_write "central" {
+  endpoint { url = "http://prometheus.observability.svc:9090/api/v1/write" }
+}
+```
+
+---
+
+## 方案对比
+
+| 维度 | cAdvisor + Prometheus | Alloy | Netdata |
+|------|----------------------|-------|---------|
+| RunC 容器 | ✅ cAdvisor 全覆盖 | ✅ | ✅ |
+| gVisor Sentry 指标 | 需单独配置 | ✅ 统一配置 | ❌ |
+| 部署复杂度 | 中 | 中 | 低 |
+| Grafana 兼容 | ⭐⭐⭐⭐⭐ | ⭐⭐⭐⭐⭐ | ⭐⭐⭐ |
+| 推荐场景 | RunC 标准方案 | Grafana 全栈 | 快速验证 |

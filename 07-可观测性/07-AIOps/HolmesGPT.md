@@ -192,7 +192,7 @@ deployment.apps/holmesgpt-holmes          1/1     1            1           46h
 curl -X POST http://localhost:30870/api/chat   -H "Content-Type: application/json"   -d '{"ask": "list pods in namespace default?", "model": "kimi"}'
 ```
 回答的所有名称空间的pod都列出来了，没过滤默认命名空间的。
-![alt text](image-5.png)
+![alt text](images/image-5.png)
 
 发现个bug：LLM 确实正确传了 "namespace": "default" 参数，但底层 kubernetes_tabular_query 工具的 shell 脚本模板硬编码了 --all-namespaces，完全忽略了传入的 namespace 参数。
 
@@ -241,7 +241,7 @@ curl -X POST http://localhost:30870/api/chat   -H "Content-Type: application/jso
 ```bash
 curl -X GET http://localhost:30870/docs
 ```
-![alt text](image-6.png)
+![alt text](images/image-6.png)
 
 
 ### 5.3 Operator 模式（持续 24/7 巡检）

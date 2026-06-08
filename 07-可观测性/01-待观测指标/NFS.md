@@ -108,3 +108,47 @@ node_exporter --collector.nfs --collector.filesystem
 | 容器中挂载 NFS | 容器内 node-exporter 无法采集，需在宿主机采集 |
 
 NFS 是基础网络文件系统，没有独立的 metrics 服务。所有指标来自 node-exporter，因此确保所有 NFS 客户端节点都部署了 node-exporter。
+
+---
+
+## 采集器方案对比
+
+| 采集器 | 部署方式 | 指标覆盖 | 日志支持 | 适用场景 |
+|--------|---------|---------|---------|---------|
+| node-exporter nfsCollector | 宿主机部署 | NFS 客户端 + 服务端 + 文件系统 | 无 | 标准方案 |
+| Grafana Alloy 内置 unix exporter | DaemonSet | 含 nfs/nfsd collector | 内置 loki.source | Grafana 全栈（方案一独有优势） |
+| Netdata | 一键安装 | 内置 nfs collector + 系统指标 | 内置日志查看 | 快速部署 |
+
+> **方案一优势**：Alloy 内置 `prometheus.exporter.unix` 含 nfs collector，无需独立 node-exporter DaemonSet。
+
+---
+
+## Alloy 采集配置
+
+```alloy
+// Alloy 内置 unix exporter 含 nfs collector
+prometheus.exporter.unix "node" {
+  set_collectors = ["cpu", "meminfo", "diskstats", "filesystem", "nfs", "nfsd", "netdev"]
+}
+
+prometheus.scrape "nfs" {
+  targets    = prometheus.exporter.unix.node.targets
+  forward_to = [prometheus.remote_write.central.receiver]
+}
+
+prometheus.remote_write "central" {
+  endpoint { url = "http://prometheus.observability.svc:9090/api/v1/write" }
+}
+```
+
+---
+
+## 方案对比
+
+| 维度 | node-exporter | Alloy 内置 unix exporter | Netdata |
+|------|--------------|------------------------|---------|
+| 部署复杂度 | 中（DaemonSet） | 低（已含在 Alloy 中） | 低 |
+| NFS 指标 | ✅ | ✅ | ✅ |
+| 宿主机指标 | ✅ | ✅ | ✅ |
+| 无需额外组件 | 需独立 DaemonSet | ✅ Alloy 统一 | ✅ |
+| 推荐场景 | 传统方案 | 方案一推荐 | 快速验证 |

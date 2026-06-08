@@ -198,7 +198,7 @@ helm upgrade --install skywalking skywalking/skywalking \
 ```
 
 页面：
-![alt text](image.png)
+![skywalking index](images/skywalking-index.png)
 
 ### 5.2 Java Agent 注入（K8s Sidecar 方式）
 

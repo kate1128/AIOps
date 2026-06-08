@@ -131,3 +131,59 @@ gitaly['prometheus_listen_addr'] = '0.0.0.0:9236'
 | GitLab Helm Chart | Cloud Native 模式，ServiceMonitor 自动发现 |
 
 Omnibus 部署默认在 `gitlab_exporter` 中聚合所有组件指标（9168/metrics），建议按组件分开采集以便更精细的告警路由。
+
+---
+
+## 采集器方案对比
+
+| 采集器 | 部署方式 | 指标覆盖 | 日志支持 | 适用场景 |
+|--------|---------|---------|---------|---------|
+| GitLab 内置 /-/metrics | 内置端点 | Rails/Sidekiq/Workhorse | 无 | 标准方案（需认证配置） |
+| GitLab Gitaly | TCP 9236 | Git 操作指标 | 无 | Gitaly 专项 |
+| GitLab Runner | TCP 9252 | CI 作业指标 | 无 | Runner 专项 |
+| Grafana Alloy | 抓取各端口 | 同上 | 内置 loki.source | Grafana 全栈 |
+| Netdata | 一键安装 | 内置 gitlab collector（社区） | 内置日志查看 | 快速部署 |
+
+---
+
+## Alloy 采集配置
+
+```alloy
+// GitLab Rails + Sidekiq（需 Bearer Token）
+prometheus.scrape "gitlab_rails" {
+  targets = [{ __address__ = "gitlab.devops.svc:80", __metrics_path__ = "/-/metrics" }]
+  authorization {
+    type        = "Bearer"
+    credentials = env("GITLAB_METRICS_TOKEN")
+  }
+  forward_to = [prometheus.remote_write.central.receiver]
+}
+
+// Gitaly
+prometheus.scrape "gitlab_gitaly" {
+  targets = [{ __address__ = "gitlab-gitaly.gitlab.svc:9236", service = "gitlab-gitaly" }]
+  forward_to = [prometheus.remote_write.central.receiver]
+}
+
+// Runner
+prometheus.scrape "gitlab_runner" {
+  targets = [{ __address__ = "gitlab-runner.gitlab.svc:9252", service = "gitlab-runner" }]
+  forward_to = [prometheus.remote_write.central.receiver]
+}
+
+prometheus.remote_write "central" {
+  endpoint { url = "http://prometheus.observability.svc:9090/api/v1/write" }
+}
+```
+
+---
+
+## 方案对比
+
+| 维度 | GitLab 内置 + Prometheus | Alloy | Netdata |
+|------|------------------------|-------|---------|
+| 部署复杂度 | 中（需认证配置） | 中 | 低 |
+| 认证/白名单 | 必须配置 | 必须配置 | 需配置 |
+| 多组件覆盖 | 需多个 scrape job | ✅ 统一配置 | 自动发现 |
+| Grafana 兼容 | ⭐⭐⭐⭐⭐ | ⭐⭐⭐⭐⭐ | ⭐⭐⭐ |
+| 推荐场景 | 已有 Prometheus 栈 | Grafana 全栈 | 快速验证 |

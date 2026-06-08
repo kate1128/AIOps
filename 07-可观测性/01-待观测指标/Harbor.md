@@ -112,3 +112,44 @@ spec:
 | K8s Harbor（Operator）| Operator 自动暴露 metrics |
 
 Harbor 5.x 默认开启 Prometheus metrics，旧版本需在 `harbor.yml` 中启用 `metrics: enabled: true`。Trivy 漏洞扫描器的指标也通过 jobservice 暴露。
+
+---
+
+## 采集器方案对比
+
+| 采集器 | 部署方式 | 指标覆盖 | 日志支持 | 适用场景 |
+|--------|---------|---------|---------|---------|
+| Harbor 内置 /metrics | 多端点 | Core/Jobservice/Registry | 无 | 标准方案（需启用配置） |
+| Grafana Alloy | 抓取各服务端口 | 同上 | 内置 loki.source | Grafana 全栈 |
+| Netdata | 一键安装 | 内置 harbor collector（社区） | 内置日志查看 | 快速部署 |
+
+---
+
+## Alloy 采集配置
+
+```alloy
+prometheus.scrape "harbor" {
+  targets = [
+    { __address__ = "harbor-core.harbor.svc:8080", service = "harbor-core" },
+    { __address__ = "harbor-jobservice.harbor.svc:9090", service = "harbor-jobservice" },
+    { __address__ = "harbor-registry.harbor.svc:5000", service = "harbor-registry" },
+  ]
+  forward_to = [prometheus.remote_write.central.receiver]
+}
+
+prometheus.remote_write "central" {
+  endpoint { url = "http://prometheus.observability.svc:9090/api/v1/write" }
+}
+```
+
+---
+
+## 方案对比
+
+| 维度 | Harbor 内置 + Prometheus | Alloy | Netdata |
+|------|------------------------|-------|---------|
+| 部署复杂度 | 低（内置端点） | 低 | 低 |
+| 多服务覆盖 | 需配置多个 target | ✅ 统一配置 | 自动发现 |
+| 配置改动 | 需启用 `metric.enabled` | 需启用 | 需启用 |
+| Grafana 兼容 | ⭐⭐⭐⭐⭐ | ⭐⭐⭐⭐⭐ | ⭐⭐⭐ |
+| 推荐场景 | 已有 Prometheus 栈 | Grafana 全栈 | 快速验证 |

@@ -120,3 +120,65 @@ nginx-prometheus-exporter --nginx.scrape-uri=http://nginx:8080/basic_status
 | K8s Ingress Controller | 10254/metrics 默认暴露，ServiceMonitor 自动发现 |
 
 Access log 通过 Promtail 采集到 Loki，可做流量分析和用户行为追踪。
+
+---
+
+## 采集器方案对比
+
+| 采集器 | 部署方式 | 指标覆盖 | 日志支持 | 适用场景 |
+|--------|---------|---------|---------|---------|
+| nginx-prometheus-exporter | 容器/二进制 | stub_status 转 Prometheus | 无 | 独立 Nginx 标准方案 |
+| K8s Ingress Controller | 内置 10254/metrics | Ingress 全量指标 | 需 Promtail | K8s Ingress 标准方案 |
+| Grafana Alloy | 抓取 exporter 端口 | 同上 | 内置 loki.source | Grafana 全栈 |
+| Netdata | 一键安装 | 内置 nginx collector | 内置日志查看 | 快速部署 |
+| OpenResty + lua-resty-prometheus | Lua 嵌入 | 自定义细粒度指标 | 无 | 需要深度定制 |
+
+---
+
+## Alloy 采集配置
+
+```alloy
+// 独立 Nginx exporter
+prometheus.scrape "nginx" {
+  targets = [{ __address__ = "nginx-exporter.ingress.svc:9113", service = "nginx" }]
+  forward_to = [prometheus.remote_write.central.receiver]
+}
+
+// K8s Ingress Controller 内置指标
+prometheus.scrape "nginx_ingress" {
+  targets = [{ __address__ = "ingress-nginx-controller.ingress.svc:10254", service = "nginx-ingress" }]
+  forward_to = [prometheus.remote_write.central.receiver]
+}
+
+prometheus.remote_write "central" {
+  endpoint { url = "http://prometheus.observability.svc:9090/api/v1/write" }
+}
+```
+
+---
+
+## Netdata 方案
+
+Netdata 内置 nginx collector，自动采集活跃连接、请求数等：
+
+```bash
+docker run -d --name=netdata \
+  -p 19999:19999 \
+  --cap-add SYS_PTRACE \
+  -v /var/run/docker.sock:/var/run/docker.sock:ro \
+  netdata/netdata
+```
+
+> 前提：Nginx 需开启 `stub_status` 端点。Netdata 通过 HTTP 采集 stub_status 数据。
+
+---
+
+## 方案对比
+
+| 维度 | nginx-exporter + Prometheus | Alloy | Netdata |
+|------|---------------------------|-------|---------|
+| 部署复杂度 | 中（需开 stub_status） | 中 | 低 |
+| Ingress 支持 | 需单独配置 | ✅ 内置 | ❌ |
+| Access Log 分析 | 需 Promtail + Loki | ✅ 内置 | ✅ 内置 |
+| Grafana 兼容 | ⭐⭐⭐⭐⭐ | ⭐⭐⭐⭐⭐ | ⭐⭐⭐ |
+| 推荐场景 | 独立 Nginx | Grafana 全栈 | 快速验证 |

@@ -108,3 +108,53 @@ spec:
 | 宿主机直跑 GPU 进程（无 HAMI）| 无 HAMI 管控，仅通过 DCGM Exporter 看总显存使用 |
 
 **关键公式：** `DCGM显存使用 − HAMI分配显存 = 宿主机裸进程显存消耗（需关注的部分）`
+
+---
+
+## 采集器方案对比
+
+| 采集器 | 部署方式 | 指标覆盖 | 日志支持 | 适用场景 |
+|--------|---------|---------|---------|---------|
+| HAMI 内置 /metrics | DaemonSet | GPU 分配/显存池/vGPU 调度 | 无 | HAMI 标准方案 |
+| DCGM Exporter | DaemonSet | GPU 硬件指标（互补） | 无 | 与 HAMI 配合使用 |
+| Grafana Alloy | 抓取 exporter 端口 | 同上 | 内置 loki.source | Grafana 全栈 |
+| Netdata | 一键安装 | 内置 nvidia_smi collector | 内置日志查看 | 快速部署 |
+
+---
+
+## Alloy 采集配置
+
+```alloy
+// HAMI 设备插件指标
+prometheus.scrape "hami" {
+  targets = [
+    { __address__ = "hami-device-plugin.gpu.svc:8080", service = "hami" },
+  ]
+  forward_to = [prometheus.remote_write.central.receiver]
+}
+
+// DCGM GPU 硬件指标（与 HAMI 互补）
+prometheus.scrape "dcgm" {
+  targets = [
+    { __address__ = "dcgm-exporter.gpu.svc:9400", service = "dcgm" },
+  ]
+  forward_to = [prometheus.remote_write.central.receiver]
+}
+
+prometheus.remote_write "central" {
+  endpoint { url = "http://prometheus.observability.svc:9090/api/v1/write" }
+}
+```
+
+---
+
+## 方案对比
+
+| 维度 | HAMI + DCGM + Prometheus | Alloy | Netdata |
+|------|------------------------|-------|---------|
+| 部署复杂度 | 中（HAMI + DCGM 两个 DaemonSet） | 中 | 低 |
+| GPU 分配指标 | ✅ HAMI | ✅ | ❌ |
+| GPU 硬件指标 | ✅ DCGM | ✅ | ✅（基础） |
+| vGPU 支持 | ✅ | ✅ | ❌ |
+| Grafana 兼容 | ⭐⭐⭐⭐⭐ | ⭐⭐⭐⭐⭐ | ⭐⭐⭐ |
+| 推荐场景 | K8s GPU 集群标准方案 | Grafana 全栈 | 快速验证 |

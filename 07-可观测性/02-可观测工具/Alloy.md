@@ -382,11 +382,11 @@ Alloy Web UI 顶部导航有三个主要入口，对应三个不同视角：
 
 **使用场景：** 日志/指标推送异常时，第一步就来这里看哪个组件变红，直接定位故障组件。点击组件名可进入详情页，看到该组件当前的参数值、内部状态和最近的错误信息。
 
-![alt text](image.png)
+![Alloy index](images/alloy-index.png)
 
 点击某个组件（如 `loki.source.kubernetes.pods`）可查看该组件当前的运行状态和已处理的日志流数量：
 
-![Alloy Component](Alloy-Component.png)
+![Alloy 组件架构](images/alloy-Component.png)
 
 #### Graph（采集管道拓扑图）
 
@@ -409,7 +409,7 @@ loki.write.default
 - 检查扩展配置后新增的组件（如 `loki.process`）是否已正确插入管道中间
 - 节点颜色和边的颜色也反映组件健康状态，红色节点代表 unhealthy
 
-![alt text](image-2.png)
+![alloy-Graph](images/alloy-Graph.png)
 
 #### Remote configuration（远端配置）
 

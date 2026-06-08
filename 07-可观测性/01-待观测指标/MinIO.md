@@ -122,3 +122,45 @@ spec:
 | K8s MinIO Operator | Operator 自动创建 ServiceMonitor |
 
 MinIO /metrics v2 需要认证，不能在 Prometheus 用 bare token，建议通过 K8s Secret 注入或配置 `MINIO_PROMETHEUS_AUTH_TYPE=public`（仅内网环境）。
+
+---
+
+## 采集器方案对比
+
+| 采集器 | 部署方式 | 指标覆盖 | 日志支持 | 适用场景 |
+|--------|---------|---------|---------|---------|
+| MinIO 内置 /metrics v2 | 内置端点 | 集群/节点/存储桶/S3 | 无 | 标准方案（需认证） |
+| Grafana Alloy | 抓取内置端点 | 同上 | 内置 loki.source | Grafana 全栈 |
+| Netdata | 一键安装 | 内置 minio collector | 内置日志查看 | 快速部署 |
+
+---
+
+## Alloy 采集配置
+
+```alloy
+// MinIO 需 Bearer Token 认证
+prometheus.scrape "minio" {
+  targets = [{ __address__ = "minio.storage.svc:9000", __metrics_path__ = "/minio/v2/metrics/cluster" }]
+  authorization {
+    type        = "Bearer"
+    credentials = env("MINIO_PROMETHEUS_TOKEN")
+  }
+  forward_to = [prometheus.remote_write.central.receiver]
+}
+
+prometheus.remote_write "central" {
+  endpoint { url = "http://prometheus.observability.svc:9090/api/v1/write" }
+}
+```
+
+---
+
+## 方案对比
+
+| 维度 | MinIO 内置 + Prometheus | Alloy | Netdata |
+|------|------------------------|-------|---------|
+| 部署复杂度 | 中（需配置认证） | 中（需 Token） | 低 |
+| Bearer Token | 必须 | 必须 | 需配置 |
+| 指标精度 | 15s | 10s | 1s |
+| Grafana 兼容 | ⭐⭐⭐⭐⭐ | ⭐⭐⭐⭐⭐ | ⭐⭐⭐ |
+| 推荐场景 | 已有 Prometheus 栈 | Grafana 全栈 | 快速验证 |

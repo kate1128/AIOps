@@ -108,3 +108,50 @@ start_http_server(9100)
 | K8s Firecrawl | Pod 中集成 metrics + ServiceMonitor |
 
 Firecrawl 本身不提供指标端点，所有监控能力需要从代码层面自行埋点。建议至少埋入请求计数、错误计数和延迟分布三个基础指标。
+
+---
+
+## 采集器方案对比
+
+| 采集器 | 部署方式 | 指标覆盖 | 日志支持 | 适用场景 |
+|--------|---------|---------|---------|---------|
+| 自定义 prometheus_client | 代码埋点 | 自定义业务指标 | 无 | 唯一方案（无社区 Exporter） |
+| Grafana Alloy | 抓取自定义端口 | 同上 | 内置 loki.source | Grafana 全栈 |
+| Blackbox Exporter | 外部探活 | HTTP 可用性 | 无 | 补充拨测 |
+
+> Firecrawl 无社区 Exporter，必须在源码中集成 `prometheus_client`，这是所有方案的共同前提。
+
+---
+
+## Alloy 采集配置
+
+```alloy
+// Firecrawl 自定义指标端口
+prometheus.scrape "firecrawl" {
+  targets = [{ __address__ = "firecrawl.ai.svc:9100", service = "firecrawl" }]
+  forward_to = [prometheus.remote_write.central.receiver]
+}
+
+// Blackbox 可用性拨测
+prometheus.scrape "firecrawl_blackbox" {
+  targets    = [{ __address__ = "http://firecrawl.ai.svc:8080/health" }]
+  metrics_path = "/probe"
+  params     = { module = ["http_2xx"] }
+  forward_to = [prometheus.remote_write.central.receiver]
+}
+
+prometheus.remote_write "central" {
+  endpoint { url = "http://prometheus.observability.svc:9090/api/v1/write" }
+}
+```
+
+---
+
+## 方案对比
+
+| 维度 | 自定义埋点 + Prometheus | Alloy | Blackbox 补充 |
+|------|----------------------|-------|--------------|
+| 部署复杂度 | 高（需代码改动） | 中 | 低 |
+| 指标内容 | 完全自定义 | 完全自定义 | 仅可用性 |
+| 开发团队配合 | 必须 | 必须 | 不需要 |
+| 推荐场景 | 内部服务 | Grafana 全栈 | 外部拨测补充 |

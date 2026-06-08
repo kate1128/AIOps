@@ -196,3 +196,15 @@ groups:
 |-----------|------|
 | vLLM 官方 Dashboard | 导入 ID 21766，包含吞吐量 / KV Cache / 延迟分布 |
 | 自建 AI 推理大盘 | 结合 DCGM 指标，GPU 层 + 推理层联动 |
+
+---
+
+## 采集器方案对比
+
+| 采集器 | 部署方式 | 指标覆盖 | 适用场景 |
+|--------|---------|---------|---------|
+| vLLM 内置 /metrics | 内置端点 | 推理性能 + KV Cache + 队列 | 标准方案（无需 Exporter） |
+| Grafana Alloy | prometheus.scrape | 同上 | Grafana 全栈 |
+| Netdata | 一键安装 | 内置 vLLM collector（社区） | 快速验证 |
+
+> vLLM 内置端点已足够完善，推荐直接使用。配合 DCGM Exporter 形成 GPU 硬件 + 推理层完整视图。

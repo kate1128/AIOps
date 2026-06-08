@@ -100,3 +100,45 @@ spec:
 | K8s Cluster | 多组件多 ServiceMonitor，每个 Pod 都有 /metrics |
 
 Milvus 依赖 etcd 和消息队列，需同步监控 etcd/mem 和 Pulsar/Kafka 指标。
+
+---
+
+## 采集器方案对比
+
+| 采集器 | 部署方式 | 指标覆盖 | 日志支持 | 适用场景 |
+|--------|---------|---------|---------|---------|
+| Milvus 内置 /metrics | 内置端点 | Proxy/QueryNode/DataNode/IndexNode | 无 | 标准方案（无需 Exporter） |
+| Grafana Alloy | 抓取内置端点 | 同上 | 内置 loki.source | Grafana 全栈 |
+| Netdata | 一键安装 | 内置 milvus collector（社区） | 内置日志查看 | 快速部署 |
+
+---
+
+## Alloy 采集配置
+
+```alloy
+prometheus.scrape "milvus" {
+  targets = [
+    { __address__ = "milvus-proxy.ai.svc:9091", service = "milvus-proxy" },
+    { __address__ = "milvus-querynode.ai.svc:9091", service = "milvus-querynode" },
+    { __address__ = "milvus-datanode.ai.svc:9091", service = "milvus-datanode" },
+    { __address__ = "milvus-indexnode.ai.svc:9091", service = "milvus-indexnode" },
+  ]
+  forward_to = [prometheus.remote_write.central.receiver]
+}
+
+prometheus.remote_write "central" {
+  endpoint { url = "http://prometheus.observability.svc:9090/api/v1/write" }
+}
+```
+
+---
+
+## 方案对比
+
+| 维度 | Milvus 内置 + Prometheus | Alloy | Netdata |
+|------|------------------------|-------|---------|
+| 部署复杂度 | 低（内置端点） | 低 | 低 |
+| 多组件覆盖 | 需配置多个 target | ✅ 统一配置 | 自动发现 |
+| 依赖组件（etcd/Kafka）| 需额外覆盖 | 需额外覆盖 | 需额外覆盖 |
+| Grafana 兼容 | ⭐⭐⭐⭐⭐ | ⭐⭐⭐⭐⭐ | ⭐⭐⭐ |
+| 推荐场景 | 已有 Prometheus 栈 | Grafana 全栈 | 快速验证 |
