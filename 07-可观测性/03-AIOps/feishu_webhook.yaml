@@ -1,0 +1,23 @@
+workflow:
+  id: test-webhook-notify
+  description: 创建模拟告警并发送到飞书
+  triggers:
+    - type: manual
+  actions:
+    - name: create-fake-alert
+      provider:
+        type: keep
+        with:
+          alert:
+            name: "测试告警"
+            severity: "critical"
+            status: "firing"
+    - name: notify-feishu
+      provider:
+        type: webhook
+        config: "{{ providers.my_feishu }}"
+        with:
+          body:
+            msg_type: "text"
+            content:
+              text: "测试告警触发：critical"

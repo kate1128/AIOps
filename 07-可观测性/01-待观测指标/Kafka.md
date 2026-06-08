@@ -112,15 +112,39 @@ Kafka 是 Java 进程，JMX Exporter 会采集 JVM 指标（GC、内存、线程
 | JMX Exporter | 嵌入 Kafka 进程 | Broker + JVM 全量 | 无 | 标准方案（需改启动参数） |
 | kafka-exporter | 独立容器 | Consumer Lag 专项 | 无 | 只关注消费延迟 |
 | JMX + kafka-exporter | 组合 | 全量覆盖 | 无 | 生产推荐 |
-| Grafana Alloy | 抓取 exporter 端口 | 同上 | 内置 loki.source | Grafana 全栈 |
+| **Grafana Alloy** | **内置 `prometheus.exporter.kafka`** | **Consumer Lag + Topic 级指标** | 内置 loki.source | **无需独立 kafka-exporter** |
 | Netdata | 一键安装 | 内置 kafka collector | 内置日志查看 | 快速部署 |
+
+> Alloy 内置 `prometheus.exporter.kafka`（基于 [grafana/kafka_exporter](https://github.com/grafana/kafka_exporter)），可直接连接 Kafka 采集 Consumer Lag、Topic 分区偏移等指标，**无需额外部署 kafka-exporter 容器**。
 
 ---
 
 ## Alloy 采集配置
 
+### 方案一：Alloy 内置 Kafka Exporter（推荐）
+
 ```alloy
-// JMX Exporter 指标
+// Alloy 内置 prometheus.exporter.kafka，直接连接 Kafka
+prometheus.exporter.kafka "example" {
+  kafka_uris = ["kafka-1:9092", "kafka-2:9092", "kafka-3:9092"]
+}
+
+// 配合 prometheus.scrape 采集
+prometheus.scrape "kafka" {
+  targets    = prometheus.exporter.kafka.example.targets
+  forward_to = [prometheus.remote_write.central.receiver]
+}
+
+prometheus.remote_write "central" {
+  endpoint { url = "http://prometheus.observability.svc:9090/api/v1/write" }
+}
+```
+
+### 方案二：Alloy 抓取 JMX Exporter（JVM 指标）
+
+```alloy
+// Kafka JMX Exporter 仍需独立部署（嵌入 -javaagent）
+// Alloy 抓取其暴露的 /metrics 端口
 prometheus.scrape "kafka_jmx" {
   targets = [
     { __address__ = "kafka-1:9999", service = "kafka-jmx" },
@@ -130,9 +154,31 @@ prometheus.scrape "kafka_jmx" {
   forward_to = [prometheus.remote_write.central.receiver]
 }
 
-// kafka-exporter（Consumer Lag）
+prometheus.remote_write "central" {
+  endpoint { url = "http://prometheus.observability.svc:9090/api/v1/write" }
+}
+```
+
+### 方案三：Alloy 内置 Kafka + JMX 组合（生产推荐）
+
+```alloy
+// Alloy 内置 Kafka Exporter（Consumer Lag + Topic 指标）
+prometheus.exporter.kafka "example" {
+  kafka_uris = ["kafka-1:9092", "kafka-2:9092", "kafka-3:9092"]
+}
+
 prometheus.scrape "kafka_exporter" {
-  targets = [{ __address__ = "kafka-exporter:9308", service = "kafka-consumer" }]
+  targets    = prometheus.exporter.kafka.example.targets
+  forward_to = [prometheus.remote_write.central.receiver]
+}
+
+// JMX Exporter（JVM 指标：GC/内存/线程）
+prometheus.scrape "kafka_jmx" {
+  targets = [
+    { __address__ = "kafka-1:9999", service = "kafka-jmx" },
+    { __address__ = "kafka-2:9999", service = "kafka-jmx" },
+    { __address__ = "kafka-3:9999", service = "kafka-jmx" },
+  ]
   forward_to = [prometheus.remote_write.central.receiver]
 }
 
@@ -160,10 +206,11 @@ docker run -d --name=netdata \
 
 ## 方案对比
 
-| 维度 | JMX Exporter + Prometheus | Alloy | Netdata |
-|------|--------------------------|-------|---------|
-| 部署复杂度 | 高（需改 Kafka 启动参数） | 高（同左 + Alloy） | 中 |
-| Kafka 侧改动 | 必须加 `-javaagent` | 必须加 `-javaagent` | 必须加 `-javaagent` |
-| Consumer Lag | 需额外 kafka-exporter | 同左 | 内置 |
-| JVM 指标 | ✅ | ✅ | ✅ |
-| 推荐场景 | 标准方案 | Grafana 全栈 | 快速验证 |
+| 维度 | JMX Exporter + Prometheus | Alloy（内置 Kafka Exporter） | Netdata |
+|------|--------------------------|----------------------------|---------|
+| 部署复杂度 | 高（需改 Kafka 启动参数） | 中（Alloy 内置 Kafka Exporter + JMX 仍需 agent） | 中 |
+| Kafka 侧改动 | 必须加 `-javaagent` | Kafka Exporter 无需改动；JVM 指标仍需 `-javaagent` | 必须加 `-javaagent` |
+| Consumer Lag | 需额外 kafka-exporter | ✅ Alloy 内置 `prometheus.exporter.kafka` | 内置 |
+| JVM 指标 | ✅ | ✅（需 JMX Exporter 配合） | ✅ |
+| Topic/Partition 指标 | 需 kafka-exporter | ✅ Alloy 内置 | ✅ |
+| 推荐场景 | 标准方案 | **Grafana 全栈（减少一个组件）** | 快速验证 |

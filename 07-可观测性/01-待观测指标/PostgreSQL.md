@@ -98,13 +98,34 @@ spec:
 | 采集器 | 部署方式 | 指标覆盖 | 日志支持 | 适用场景 |
 |--------|---------|---------|---------|---------|
 | postgres_exporter | 容器/二进制 | pg_stat_* 视图全量 | 无 | Prometheus 标准方案 |
-| Grafana Alloy | 需 postgres_exporter | 通过 prometheus.scrape 抓 exporter | 内置 loki.source | Grafana 全栈 |
+| **Grafana Alloy** | **内置 `prometheus.exporter.postgres`** | **直接连接 PostgreSQL，无需 exporter** | 内置 loki.source | **Grafana 全栈（减少一个组件）** |
 | Netdata | 一键安装 | 内置 postgres collector | 内置日志查看 | 快速部署 |
 | pg_stat_statements | PostgreSQL 扩展 | 查询级性能分析 | 无 | 深度 SQL 调优 |
+
+> Alloy 内置 `prometheus.exporter.postgres`（基于 [wrouesnel/postgres_exporter](https://github.com/wrouesnel/postgres_exporter)），可直接连接 PostgreSQL 采集指标，**无需额外部署 postgres_exporter 容器**。详见 [Alloy 官方文档](https://grafana.com/docs/alloy/latest/reference/components/prometheus.prometheus.exporter.postgres/)。
 
 ---
 
 ## Alloy 采集配置
+
+### 方案一：Alloy 内置 PostgreSQL Exporter（推荐）
+
+```alloy
+prometheus.exporter.postgres "example" {
+  data_source_names = ["postgresql://postgres:password@postgres.db.svc:5432/postgres?sslmode=disable"]
+}
+
+prometheus.scrape "postgresql" {
+  targets    = prometheus.exporter.postgres.example.targets
+  forward_to = [prometheus.remote_write.central.receiver]
+}
+
+prometheus.remote_write "central" {
+  endpoint { url = "http://prometheus.observability.svc:9090/api/v1/write" }
+}
+```
+
+### 方案二：Alloy 抓取外部 postgres_exporter（兼容现有部署）
 
 ```alloy
 prometheus.scrape "postgresql" {
