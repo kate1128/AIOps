@@ -1,154 +1,151 @@
-﻿# NFS 可观测性
+# NFS 可观测性调研
 
-> NFS 客户端的指标由 node-exporter 的 `nfsCollector` 采集；服务端指标同样通过 node-exporter 的文件系统指标覆盖。
+**更新日期：** 2026年06月09日
+**信息来源：** 官方文档、GitHub 仓库、Grafana Alloy 官方回答、社区实践
+**参考地址：**
 
----
-
-## 可观测性组件
-
-| 组件 | 说明 | 暴露方式 |
-|------|------|---------|
-| node-exporter nfsCollector | NFS 客户端操作统计（v2/v3/v4） | TCP 9100 /metrics |
-| node-exporter filesystemCollector | 磁盘挂载容量和使用量 | TCP 9100 /metrics |
-| NFS Server stats | 服务端 nfsd 统计（只读 procfs）| 需额外脚本或 node-exporter 自定义收集器 |
-
-NFS 自身不提供 HTTP metrics 端点，所有监控依赖 node-exporter 和操作系统 procfs。
+1. Node Exporter：[prometheus/node_exporter](https://github.com/prometheus/node_exporter)
+2. Alloy unix exporter：[prometheus.exporter.unix](https://grafana.com/docs/alloy/latest/reference/components/prometheus.exporter.unix/)
+3. Linux nfsstat：[nfsstat man page](https://man7.org/linux/man-pages/man8/nfsstat.8.html)
 
 ---
 
-## 核心指标
+## 1. 结论摘要
 
-### NFS 客户端
+NFS 本身不提供 HTTP metrics 端点，Linux 主机侧 NFS 指标来自 `/proc/net/rpc/nfs`、`/proc/net/rpc/nfsd`、`/proc/self/mountstats` 和文件系统指标。Grafana Alloy **部分支持 NFS 指标采集**：通过内置 `prometheus.exporter.unix` 采集 node_exporter 等价的 `nfs`、`nfsd`、`mountstats` 指标。其中 `nfs`/`nfsd` 通常默认可用，`mountstats` 需手动启用。Kubernetes NFS Provisioner 若暴露 Prometheus 端点，也可通过 `discovery.kubernetes + prometheus.scrape` 采集。
 
-| 指标（node-exporter） | 含义 | 告警建议 |
-|----------------------|------|---------|
-| `node_nfs_requests_total` | NFS 操作请求总数（按操作类型分）| — |
-| `node_nfs_requests_total{operation="read"}` | 读操作次数 | — |
-| `node_nfs_requests_total{operation="write"}` | 写操作次数 | — |
-| `node_nfs_rpc_authentication_refreshes_total` | RPC 认证刷新次数 | 突增说明认证问题 |
+| 关键信息 | 值 |
+| --- | --- |
+| 主流采集方式 | Alloy unix exporter / node-exporter |
+| 客户端指标 | `nfs` collector（`/proc/net/rpc/nfs`）|
+| 服务端指标 | `nfsd` collector（`/proc/net/rpc/nfsd`）|
+| 挂载点详细指标 | `mountstats` collector（需启用）|
+| K8s Provisioner | 需确认是否暴露 Prometheus 端点 |
 
-### 文件系统
+---
+
+## 2. 产品概况（NFS 指标来源）
+
+| 来源 | 内容 | 说明 |
+| --- | --- | --- |
+| `/proc/net/rpc/nfs` | NFS Client RPC 统计 | 客户端请求、认证刷新等 |
+| `/proc/net/rpc/nfsd` | NFS Server RPC 统计 | 服务端请求、线程、操作分布 |
+| `/proc/self/mountstats` | 单挂载点统计 | 延迟、操作、重传 |
+| filesystem collector | 容量与 inode | NFS 挂载点空间告警 |
+
+---
+
+## 3. 核心指标
 
 | 指标 | 含义 | 告警建议 |
-|------|------|---------|
-| `node_filesystem_size_bytes{mountpoint=~"/nfs.*"}` | NFS 挂载点总大小 | — |
-| `node_filesystem_avail_bytes{mountpoint=~"/nfs.*"}` | NFS 挂载点可用空间 | < 10% 告警 |
-| `node_filesystem_files_free{mountpoint=~"/nfs.*"}` | NFS inode 剩余 | < 5% 告警 |
-| `node_disk_io_time_seconds_total{device="nfs"}` | NFS 磁盘 IO 时间 | — |
-
-### NFS 服务端（nfsd）
-
-| 指标 | 含义 |
-|------|------|
-| `node_nfsd_server_rpcs_total` | 服务端处理的 RPC 请求数 |
-| `node_nfsd_requests_total` | nfsd 线程处理请求数 |
-| `node_nfsd_connections_total` | 当前 NFS 连接数 |
+| --- | --- | --- |
+| `node_nfs_requests_total` | NFS 客户端请求数 | 按 operation 分析 |
+| `node_nfs_rpc_authentication_refreshes_total` | RPC 认证刷新 | 突增排查认证问题 |
+| `node_nfsd_server_rpcs_total` | NFS 服务端 RPC | QPS 基线 |
+| `node_nfsd_requests_total` | nfsd 请求数 | 按操作类型分析 |
+| `node_filesystem_avail_bytes{fstype=~"nfs.*"}` | NFS 可用空间 | < 10% 告警 |
+| `node_filesystem_files_free{fstype=~"nfs.*"}` | NFS inode 剩余 | < 5% 告警 |
 
 ---
 
-## 采集集成
+## 4. 采集器方案对比
 
-```yaml
-# node-exporter 默认启用 nfsCollector 和 filesystemCollector
-# 无需额外配置，启动后自动采集
-
-# 确认 nfsCollector 是否启用（默认开启）
-node_exporter --collector.nfs --collector.filesystem
-
-# Prometheus scrape
-- job_name: nfs-client
-  static_configs:
-    - targets:
-        - "nfs-client-node:9100"
-      labels:
-        service: nfs
-        role: client
-
-- job_name: nfs-server
-  static_configs:
-    - targets:
-        - "nfs-server-node:9100"
-      labels:
-        service: nfs
-        role: server
-```
+| 采集器 | 部署方式 | 指标覆盖 | 适用场景 |
+| --- | --- | --- | --- |
+| node-exporter | 宿主机 / DaemonSet | nfs / nfsd / filesystem | 传统方案 |
+| **Alloy unix exporter** | Alloy 内置 | nfs / nfsd / mountstats / filesystem | **本项目首选** |
+| Netdata | Agent | NFS + 系统指标 | 快速验证 |
+| NFS Provisioner metrics | 应用端点 | Provisioner 自身 | 需验证 |
 
 ---
 
-## 告警规则
+## 5. Alloy 集成方案（推荐）
 
-```yaml
-- alert: NfsDiskSpaceLow
-  expr: node_filesystem_avail_bytes{mountpoint=~".*nfs.*"} / node_filesystem_size_bytes{mountpoint=~".*nfs.*"} * 100 < 10
-  for: 5m
-  annotations:
-    summary: "NFS 挂载点 {{ $labels.mountpoint }} 可用空间不足 10%"
-
-- alert: NfsInodesExhausted
-  expr: node_filesystem_files_free{mountpoint=~".*nfs.*"} / node_filesystem_files{mountpoint=~".*nfs.*"} * 100 < 5
-  for: 5m
-  annotations:
-    summary: "NFS 挂载点 inode 即将耗尽（{{ $labels.mountpoint }}）"
-
-- alert: NfsHighWriteRate
-  expr: rate(node_disk_io_time_seconds_total{device=~"nfs.*"}[5m]) > 0.8
-  for: 10m
-  annotations:
-    summary: "NFS 磁盘 IO 占用率 > 80%"
-```
-
----
-
-## 部署注意事项（混合部署适配）
-
-| 部署方式 | 采集方式 |
-|---------|---------|
-| NFS Server（物理机） | node-exporter 覆盖 filesystem + nfsd 统计 |
-| NFS Client（所有节点） | node-exporter 采集客户端操作指标 |
-| 容器中挂载 NFS | 容器内 node-exporter 无法采集，需在宿主机采集 |
-
-NFS 是基础网络文件系统，没有独立的 metrics 服务。所有指标来自 node-exporter，因此确保所有 NFS 客户端节点都部署了 node-exporter。
-
----
-
-## 采集器方案对比
-
-| 采集器 | 部署方式 | 指标覆盖 | 日志支持 | 适用场景 |
-|--------|---------|---------|---------|---------|
-| node-exporter nfsCollector | 宿主机部署 | NFS 客户端 + 服务端 + 文件系统 | 无 | 标准方案 |
-| Grafana Alloy 内置 unix exporter | DaemonSet | 含 nfs/nfsd collector | 内置 loki.source | Grafana 全栈（方案一独有优势） |
-| Netdata | 一键安装 | 内置 nfs collector + 系统指标 | 内置日志查看 | 快速部署 |
-
-> **方案一优势**：Alloy 内置 `prometheus.exporter.unix` 含 nfs collector，无需独立 node-exporter DaemonSet。
-
----
-
-## Alloy 采集配置
+### 5.1 Linux 主机 NFS 指标
 
 ```alloy
-// Alloy 内置 unix exporter 含 nfs collector
-prometheus.exporter.unix "node" {
-  set_collectors = ["cpu", "meminfo", "diskstats", "filesystem", "nfs", "nfsd", "netdev"]
+prometheus.exporter.unix "nfs" {
+  set_collectors = ["cpu", "meminfo", "filesystem", "diskstats", "netdev", "nfs", "nfsd"]
+  enable_collectors = ["mountstats"]
 }
 
 prometheus.scrape "nfs" {
-  targets    = prometheus.exporter.unix.node.targets
+  targets = prometheus.exporter.unix.nfs.targets
   forward_to = [prometheus.remote_write.central.receiver]
+  job_name = "nfs"
+}
+```
+
+### 5.2 Kubernetes NFS Provisioner（需验证）
+```alloy
+discovery.kubernetes "nfs_provisioner" {
+  role = "pod"
+  selectors { role = "pod" label = "app=nfs-subdir-external-provisioner" }
 }
 
-prometheus.remote_write "central" {
-  endpoint { url = "http://prometheus.observability.svc:9090/api/v1/write" }
+prometheus.scrape "nfs_provisioner" {
+  targets = discovery.kubernetes.nfs_provisioner.targets
+  forward_to = [prometheus.remote_write.central.receiver]
+  job_name = "nfs-provisioner"
 }
 ```
 
 ---
 
-## 方案对比
+## 6. 部署方式对比
 
-| 维度 | node-exporter | Alloy 内置 unix exporter | Netdata |
-|------|--------------|------------------------|---------|
-| 部署复杂度 | 中（DaemonSet） | 低（已含在 Alloy 中） | 低 |
-| NFS 指标 | ✅ | ✅ | ✅ |
-| 宿主机指标 | ✅ | ✅ | ✅ |
-| 无需额外组件 | 需独立 DaemonSet | ✅ Alloy 统一 | ✅ |
-| 推荐场景 | 传统方案 | 方案一推荐 | 快速验证 |
+| 场景 | 采集方式 |
+| --- | --- |
+| NFS Client | 每个客户端节点部署 Alloy unix exporter |
+| NFS Server | 服务端节点启用 `nfsd` collector |
+| 容器内挂载 NFS | 在宿主机采集，不在业务容器内采集 |
+| K8s NFS Provisioner | Pod metrics（若暴露）+ 宿主机 NFS 指标 |
+
+---
+
+## 7. 告警规则
+
+```yaml
+groups:
+- name: nfs.rules
+  rules:
+  - alert: NfsDiskSpaceLow
+    expr: node_filesystem_avail_bytes{fstype=~"nfs.*"} / node_filesystem_size_bytes{fstype=~"nfs.*"} < 0.1
+    for: 5m
+    labels: { severity: warning }
+    annotations: { summary: "NFS 挂载点可用空间不足 10%" }
+
+  - alert: NfsInodesLow
+    expr: node_filesystem_files_free{fstype=~"nfs.*"} / node_filesystem_files{fstype=~"nfs.*"} < 0.05
+    for: 5m
+    labels: { severity: warning }
+    annotations: { summary: "NFS inode 剩余不足 5%" }
+```
+
+---
+
+## 8. Grafana Dashboard
+
+推荐使用 NFS、NFS mountstats、Node Exporter Full 等 Dashboard。基础 NFS 看 `nfs`/`nfsd`，延迟和单挂载点问题看 `mountstats`。
+
+---
+
+## 9. KAgent 集成（NFS 运维 Agent）
+
+推荐绑定 PrometheusServer 查询 NFS 容量、inode、RPC 操作、mountstats 延迟，并用 Git-Based Skills 注入 NFS 卡顿、挂载失效、服务端不可达、Provisioner 异常处理 SOP。
+
+---
+
+## 10. 常见问题
+
+### Grafana Alloy 支持 NFS 指标吗？
+
+**部分支持。** Linux 主机 NFS 客户端/服务端指标由 Alloy 内置 `prometheus.exporter.unix` 支持；Kubernetes NFS Provisioner 是否可采集取决于它是否暴露 Prometheus 端点。
+
+### mountstats 默认启用吗？
+
+通常不是默认启用。需要在 `prometheus.exporter.unix` 中手动启用 `mountstats` collector，用于更详细的 NFS 客户端延迟和操作统计。
+
+### NFS Client 和 Server 要分开看吗？
+
+要分开。Client 侧更适合定位业务节点卡顿、重传和挂载问题；Server 侧更适合定位 NFS 服务端压力、线程和磁盘容量问题。

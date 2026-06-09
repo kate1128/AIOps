@@ -1,210 +1,192 @@
-# vLLM — AI 推理服务指标
+# vLLM 可观测性调研
 
-## 概述
+**更新日期：** 2026年06月09日
+**信息来源：** 官方文档、GitHub 仓库、Grafana Alloy 官方回答、社区实践
+**参考地址：**
 
-vLLM 是高性能大语言模型推理引擎（PagedAttention + 连续批处理），内置 Prometheus 指标端点，无需额外 Exporter 即可直接被 Prometheus 采集。
-
-- GitHub: [vllm-project/vllm](https://github.com/vllm-project/vllm) ⭐ ~43k
-- 默认指标端口: 与服务端口相同，路径 `/metrics`（默认 8000）
-- CNCF 状态: 非 CNCF 项目，但已是 AI 推理事实标准
-
----
-
-## 核心能力（可观测性维度）
-
-- **推理性能全覆盖**：TTFT（首 Token 延迟）、TPOT（Token 间延迟）、E2E 延迟、吞吐量
-- **KV Cache 状态**：缓存命中率、占用率是判断推理瓶颈的关键指标
-- **请求队列**：等待/运行/完成请求数，用于判断负载压力
-- **GPU 显存**：通过 KV Cache 使用量间接反映，配合 DCGM Exporter 形成完整视图
+1. vLLM GitHub：[vllm-project/vllm](https://github.com/vllm-project/vllm)
+2. vLLM Metrics：[vLLM Production Metrics](https://docs.vllm.ai/)
+3. KServe vLLM：[KServe vLLM runtime](https://kserve.github.io/website/)
+4. Alloy 抓取配置：[prometheus.scrape](https://grafana.com/docs/alloy/latest/reference/components/prometheus.scrape/)
+5. Grafana Dashboard：[vLLM Dashboard #21766](https://grafana.com/grafana/dashboards/21766)
 
 ---
 
-## 核心指标
+## 1. 结论摘要
 
-### 推理性能
+vLLM 内置 Prometheus `/metrics` 端点，指标以 `vllm:` 为前缀，覆盖 TTFT、TPOT、端到端延迟、请求队列、Token 吞吐、KV Cache、抢占/Swap 等推理层状态。Grafana Alloy **可以直接通过 `prometheus.scrape` 采集 vLLM 指标**。完整 AI 推理可观测性应将 vLLM 指标与 DCGM GPU 硬件指标联动分析。官方回答与调研结论一致，并补充了 KServe + vLLM 的 Helm、InferenceService annotation、ServiceMonitor 场景。
 
-| 指标 | 含义 | 告警建议 |
-|------|------|---------|
-| `vllm:time_to_first_token_seconds` | 首 Token 延迟（TTFT，Histogram）| P99 > 5s 告警（正常应 < 2s）|
-| `vllm:time_per_output_token_seconds` | 每个输出 Token 的生成间隔（TPOT）| P99 > 500ms 关注 |
-| `vllm:e2e_request_latency_seconds` | 端到端请求延迟 | P99 > 30s 告警 |
-| `vllm:request_success_total` | 成功完成的请求数 | — |
-| `vllm:request_prompt_tokens_total` | 总输入 Token 数 | 用于成本核算 |
-| `vllm:request_generation_tokens_total` | 总输出 Token 数 | 用于成本核算 |
-
-### 请求队列
-
-| 指标 | 含义 | 告警建议 |
-|------|------|---------|
-| `vllm:num_requests_waiting` | 等待调度的请求数 | > 50 持续 5m 说明 GPU 算力不足 |
-| `vllm:num_requests_running` | 正在执行批处理的请求数 | 接近 `max_batch_size` 关注 |
-| `vllm:num_requests_swapped` | 被换出到 CPU 的请求数 | > 0 说明 KV Cache 满了，性能严重下降 |
-
-### KV Cache（核心 GPU 显存指标）
-
-| 指标 | 含义 | 告警建议 |
-|------|------|---------|
-| `vllm:gpu_cache_usage_perc` | GPU KV Cache 占用百分比 | > 90% 持续 5m P1 告警 |
-| `vllm:cpu_cache_usage_perc` | CPU KV Cache 占用百分比 | > 50% 说明已开始 Swap，需扩容 GPU |
-| `vllm:gpu_prefix_cache_hit_rate` | 前缀 KV Cache 命中率 | < 30% 可考虑调整 `enable_prefix_caching` |
-
-### 系统健康
-
-| 指标 | 含义 | 告警建议 |
-|------|------|---------|
-| `vllm:num_preemptions_total` | 被抢占（换出）的请求次数 | > 0 持续增长 P2 告警 |
-| `vllm:avg_generation_throughput_toks_per_s` | 平均生成吞吐量（Tokens/s）| 骤降说明 GPU 异常或负载过高 |
-| `vllm:avg_prompt_throughput_toks_per_s` | 平均输入 Token 处理速率 | — |
+| 关键信息 | 值 |
+| --- | --- |
+| 主流采集方式 | vLLM 内置 `/metrics` |
+| 默认端口 | 与 OpenAI API 服务同端口，常见 `8000` |
+| 指标前缀 | `vllm:` |
+| Alloy 集成 | `prometheus.scrape` 直接抓取 |
+| 推荐组合 | vLLM 推理指标 + DCGM GPU 指标 |
+| 推荐 Dashboard | vLLM Dashboard ID 21766 / KServe vLLM Dashboard |
 
 ---
 
-## 在本项目中的使用
+## 2. 产品概况（vLLM metrics）
 
-### 当前状态
+| 维度 | 指标内容 |
+| --- | --- |
+| 推理延迟 | TTFT、TPOT、E2E latency |
+| 吞吐量 | prompt/generation tokens per second |
+| 请求队列 | waiting / running / swapped requests |
+| KV Cache | GPU/CPU cache usage、prefix hit rate |
+| 成本核算 | prompt tokens、generation tokens |
+| 硬件互补 | DCGM GPU 利用率、显存、温度、XID 错误 |
 
-> 🟡 vLLM `/metrics` 端点已就绪，但 Prometheus ServiceMonitor 未配置，指标未纳入 Grafana 可视化。
+---
 
-### 启动参数
+## 3. 核心指标
+
+| 指标 | 含义 | 告警建议 |
+| --- | --- | --- |
+| `vllm:time_to_first_token_seconds` | 首 Token 延迟 TTFT | P99 > 5s 告警 |
+| `vllm:time_per_output_token_seconds` | Token 间延迟 TPOT | P99 > 500ms 关注 |
+| `vllm:e2e_request_latency_seconds` | 端到端延迟 | P99 > 30s 告警 |
+| `vllm:num_requests_waiting` | 等待请求数 | > 50 持续 5m 告警 |
+| `vllm:num_requests_running` | 运行中请求数 | 接近并发上限关注 |
+| `vllm:num_requests_swapped` | 被换出请求数 | > 0 告警 |
+| `vllm:gpu_cache_usage_perc` | GPU KV Cache 使用率 | > 90% P1 |
+| `vllm:cpu_cache_usage_perc` | CPU KV Cache 使用率 | > 50% 说明 Swap 风险 |
+| `vllm:request_generation_tokens_total` | 输出 Token 总数 | 成本/吞吐核算 |
+
+---
+
+## 4. 采集器方案对比
+
+| 采集器 | 部署方式 | 指标覆盖 | 适用场景 |
+| --- | --- | --- | --- |
+| vLLM 内置 `/metrics` | 原生端点 | 推理层全量 | 标准方案 |
+| **Grafana Alloy** | `prometheus.scrape` | 抓取 vLLM 指标 | **本项目首选** |
+| KServe ServiceMonitor | 注解 / CRD | KServe + vLLM | 模型服务平台 |
+| DCGM Exporter | DaemonSet | GPU 硬件指标 | 必配互补 |
+
+---
+
+## 5. Alloy 集成方案（推荐）
+
+### 5.1 独立部署 vLLM
+
+```alloy
+prometheus.scrape "vllm" {
+  targets = [
+    { __address__ = "vllm-qwen.ai.svc:8000", model = "qwen2-7b" },
+    { __address__ = "vllm-deepseek.ai.svc:8000", model = "deepseek-v3" },
+  ]
+  metrics_path = "/metrics"
+  scrape_interval = "15s"
+  forward_to = [prometheus.remote_write.central.receiver]
+  job_name = "vllm"
+}
+```
+
+### 5.2 KServe + vLLM
+```bash
+helm upgrade kserve oci://ghcr.io/kserve/charts/kserve \
+  --reuse-values \
+  --set metricsaggregator.enablePrometheusScraping=true
+```
+
+```yaml
+metadata:
+  annotations:
+    serving.kserve.io/enable-prometheus-scraping: "true"
+```
+
+### 5.3 ServiceMonitor 示例
+```yaml
+apiVersion: monitoring.coreos.com/v1
+kind: ServiceMonitor
+metadata:
+  name: vllm-model
+spec:
+  selector:
+    matchLabels:
+      serving.kserve.io/inferenceservice: qwen
+  endpoints:
+  - port: qwen-predictor
+    path: /metrics
+    interval: 15s
+```
+
+### 5.4 与 DCGM 联动
+```alloy
+prometheus.scrape "dcgm" {
+  targets = [{ __address__ = "dcgm-exporter.gpu.svc:9400", service = "dcgm" }]
+  forward_to = [prometheus.remote_write.central.receiver]
+  job_name = "dcgm"
+}
+```
+
+---
+
+## 6. 启动配置要点
 
 ```bash
-# vLLM 服务启动（指标端点默认随 HTTP 端口一起开启）
 python -m vllm.entrypoints.openai.api_server \
   --model /models/Qwen2.5-7B-Instruct \
   --served-model-name qwen2-7b \
   --host 0.0.0.0 \
   --port 8000 \
-  --max-model-len 8192 \
   --gpu-memory-utilization 0.90 \
   --enable-prefix-caching
-  # 指标自动在 http://0.0.0.0:8000/metrics 暴露
-```
-
-### K8s ServiceMonitor
-
-```yaml
-apiVersion: monitoring.coreos.com/v1
-kind: ServiceMonitor
-metadata:
-  name: vllm
-  namespace: observability
-spec:
-  namespaceSelector:
-    matchNames:
-      - ai
-  selector:
-    matchLabels:
-      app: vllm
-  endpoints:
-    - port: http
-      path: /metrics
-      interval: 15s
-```
-
-### Alloy 采集配置（方案一）
-
-```river
-prometheus.scrape "vllm" {
-  targets = [
-    { __address__ = "vllm-qwen.ai.svc:8000",   model = "qwen2-7b" },
-    { __address__ = "vllm-deepseek.ai.svc:8000", model = "deepseek-v3" },
-  ]
-  metrics_path = "/metrics"
-  forward_to   = [prometheus.remote_write.central.receiver]
-}
-```
-
-### 关键 PromQL 查询
-
-```promql
-# TTFT P99（过去 5 分钟）
-histogram_quantile(0.99,
-  rate(vllm:time_to_first_token_seconds_bucket[5m])
-)
-
-# KV Cache 使用率（各实例）
-vllm:gpu_cache_usage_perc
-
-# 请求积压量
-vllm:num_requests_waiting
-
-# Token 吞吐量（每秒生成 Token 数）
-rate(vllm:request_generation_tokens_total[5m])
-
-# 各模型输入/输出 Token 用量（成本核算）
-sum by (model_name) (
-  rate(vllm:request_prompt_tokens_total[1h])
-)
-sum by (model_name) (
-  rate(vllm:request_generation_tokens_total[1h])
-)
 ```
 
 ---
 
-## 告警规则
+## 7. 告警规则
 
 ```yaml
 groups:
-  - name: vllm
-    rules:
-      - alert: VLLMHighFirstTokenLatency
-        expr: |
-          histogram_quantile(0.99,
-            rate(vllm:time_to_first_token_seconds_bucket[5m])
-          ) > 5
-        for: 5m
-        labels:
-          severity: warning
-        annotations:
-          summary: "vLLM TTFT P99 超过 5 秒"
+- name: vllm.rules
+  rules:
+  - alert: VLLMHighFirstTokenLatency
+    expr: histogram_quantile(0.99, rate(vllm:time_to_first_token_seconds_bucket[5m])) > 5
+    for: 5m
+    labels: { severity: warning }
+    annotations: { summary: "vLLM TTFT P99 超过 5s" }
 
-      - alert: VLLMKVCacheAlmostFull
-        expr: vllm:gpu_cache_usage_perc > 0.90
-        for: 5m
-        labels:
-          severity: critical
-        annotations:
-          summary: "vLLM GPU KV Cache 占用超过 90%，即将出现请求 Swap"
+  - alert: VLLMKVCacheAlmostFull
+    expr: vllm:gpu_cache_usage_perc > 0.90
+    for: 5m
+    labels: { severity: critical }
+    annotations: { summary: "vLLM GPU KV Cache 使用率超过 90%" }
 
-      - alert: VLLMRequestQueueBuildup
-        expr: vllm:num_requests_waiting > 50
-        for: 5m
-        labels:
-          severity: warning
-        annotations:
-          summary: "vLLM 请求队列积压 {{ $value }} 个，GPU 算力可能不足"
+  - alert: VLLMRequestQueueBuildup
+    expr: vllm:num_requests_waiting > 50
+    for: 5m
+    labels: { severity: warning }
+    annotations: { summary: "vLLM 请求队列积压" }
 ```
 
 ---
 
-## 与 DCGM Exporter 的配合
+## 8. Grafana Dashboard
 
-> vLLM 指标反映的是推理层的业务状态，DCGM Exporter 反映的是 GPU 硬件层状态。两者互补：
-
-| 场景 | vLLM 指标 | DCGM 指标 |
-|------|---------|----------|
-| 请求延迟高 | TTFT 升高，queue waiting 增加 | GPU 利用率是否满载 |
-| 显存耗尽 | KV Cache 100%，请求被 Swap | FB_USED 达到上限 |
-| GPU 故障 | 吞吐量骤降 | XID 错误，ECC 错误 |
-| 算力不足 | waiting 请求堆积 | 利用率长期 > 95% |
+推荐使用 vLLM Dashboard ID 21766 或 KServe vLLM Dashboard，并与 DCGM Dashboard 联动展示：GPU 利用率、显存、KV Cache、TTFT、TPOT、Token 吞吐、XID 错误。
 
 ---
 
-## Grafana Dashboard
+## 9. KAgent 集成（vLLM 运维 Agent）
 
-| Dashboard | 说明 |
-|-----------|------|
-| vLLM 官方 Dashboard | 导入 ID 21766，包含吞吐量 / KV Cache / 延迟分布 |
-| 自建 AI 推理大盘 | 结合 DCGM 指标，GPU 层 + 推理层联动 |
+推荐绑定 PrometheusServer 查询 vLLM、DCGM、Kubernetes 指标，并用 Git-Based Skills 注入 TTFT 高、KV Cache 满、请求积压、模型副本扩缩容、prefix cache 命中率排查 SOP。
 
 ---
 
-## 采集器方案对比
+## 10. 常见问题
 
-| 采集器 | 部署方式 | 指标覆盖 | 适用场景 |
-|--------|---------|---------|---------|
-| vLLM 内置 /metrics | 内置端点 | 推理性能 + KV Cache + 队列 | 标准方案（无需 Exporter） |
-| Grafana Alloy | prometheus.scrape | 同上 | Grafana 全栈 |
-| Netdata | 一键安装 | 内置 vLLM collector（社区） | 快速验证 |
+### Grafana Alloy 能采集 vLLM 指标吗？
 
-> vLLM 内置端点已足够完善，推荐直接使用。配合 DCGM Exporter 形成 GPU 硬件 + 推理层完整视图。
+**可以。** vLLM 内置 Prometheus `/metrics`，Alloy 可用 `prometheus.scrape` 直接抓取。
+
+### KServe 场景有什么区别？
+
+KServe 需要启用 Prometheus 抓取，并给 InferenceService 添加 `serving.kserve.io/enable-prometheus-scraping: "true"` 注解，再通过 ServiceMonitor 或 Alloy 抓取 predictor 端口。
+
+### vLLM 指标能替代 DCGM 吗？
+
+不能。vLLM 指标反映推理层队列、延迟和 KV Cache；DCGM 反映 GPU 硬件层利用率、显存、温度和错误。两者必须联动分析。

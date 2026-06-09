@@ -1,184 +1,191 @@
-﻿# Nginx 可观测性
+# Nginx 可观测性调研
 
-> 通过 stub_status + nginx-prometheus-exporter 或 nginx-ingress-controller 内置指标采集。
+**更新日期：** 2026年06月09日
+**信息来源：** 官方文档、GitHub 仓库、Grafana Alloy 官方回答、社区实践
+**参考地址：**
 
----
-
-## 可观测性组件
-
-| 组件 | 说明 | 暴露方式 |
-|------|------|---------|
-| stub_status | Nginx 原生状态页（活跃连接/请求数） | TCP 8080 /basic_status |
-| nginx-prometheus-exporter | 读取 stub_status 转为 Prometheus 格式 | TCP 9113 /metrics |
-| nginx-ingress-controller | K8s Ingress 内置 Prometheus 指标 | TCP 10254 /metrics |
-| OpenResty / lua-resty | lua 自定义指标，暴露给 Prometheus | 自定义端点 |
+1. nginx-prometheus-exporter：[nginxinc/nginx-prometheus-exporter](https://github.com/nginxinc/nginx-prometheus-exporter)
+2. NGINX stub_status：[Module ngx_http_stub_status_module](https://nginx.org/en/docs/http/ngx_http_stub_status_module.html)
+3. Ingress NGINX metrics：[ingress-nginx monitoring](https://kubernetes.github.io/ingress-nginx/user-guide/monitoring/)
+4. Alloy NGINX 场景：[alloy-scenarios/nginx-monitoring](https://github.com/grafana/alloy-scenarios/tree/main/nginx-monitoring)
 
 ---
 
-## 核心指标
+## 1. 结论摘要
 
-### 基础 Nginx
+Nginx 指标采集有两类主流场景：独立 Nginx 使用 `stub_status + nginx-prometheus-exporter`，Kubernetes Ingress NGINX 使用 Controller 内置 `:10254/metrics`。Grafana Alloy **完全支持采集 NGINX 指标和日志**：指标通过 `prometheus.scrape` 抓取 exporter/Ingress 端点，访问日志通过 `loki.source.file` 采集 JSON access log。官方回答与调研结论一致，并补充了 Grafana Cloud NGINX 集成的 2 个 Dashboard、日志分析和 GeoIP2 能力。
 
-| 指标（exporter 采集） | 含义 | 告警建议 |
-|----------------------|------|---------|
-| `nginx_connections_active` | 活跃连接数 | > 90% worker_connections 告警 |
-| `nginx_connections_accepted` | 累计接受连接数 | — |
-| `nginx_http_requests_total` | HTTP 请求总数 | — |
-| `nginx_up` | Nginx 进程是否存活 | == 0 告警 |
+| 关键信息 | 值 |
+| --- | --- |
+| 独立 Nginx 指标 | stub_status + nginx-prometheus-exporter `:9113/metrics` |
+| Ingress 指标 | NGINX Ingress Controller `:10254/metrics` |
+| 日志采集 | JSON access log -> Loki |
+| Alloy 集成 | `prometheus.scrape` + `loki.source.file` |
+| 官方示例 | `alloy-scenarios/nginx-monitoring` |
 
-### Ingress Controller
+---
+
+## 2. 产品概况
+
+| 组件 | 指标内容 | 说明 |
+| --- | --- | --- |
+| stub_status | 活跃连接、请求数 | Nginx 原生状态页 |
+| nginx-prometheus-exporter | Prometheus 格式转换 | 独立 Nginx 标准方案 |
+| NGINX Ingress Controller | Ingress 请求、上游延迟、证书 | K8s 标准方案 |
+| Loki access log | 状态码、URI、IP、User-Agent、耗时 | 流量分析 |
+
+---
+
+## 3. 核心指标
 
 | 指标 | 含义 | 告警建议 |
-|------|------|---------|
-| `nginx_ingress_controller_requests` | Ingress 请求数（按 host/status 分）| — |
+| --- | --- | --- |
+| `nginx_up` | Nginx exporter 是否正常 | == 0 告警 |
+| `nginx_connections_active` | 活跃连接 | > 90% worker_connections 告警 |
+| `nginx_connections_accepted` | 已接受连接数 | QPS 基线 |
+| `nginx_http_requests_total` | HTTP 请求总量 | 错误率分母 |
+| `nginx_ingress_controller_requests` | Ingress 请求数 | 按 status/host 分析 |
 | `nginx_ingress_controller_ingress_upstream_latency_seconds` | 上游延迟 | P99 > 2s 告警 |
 | `nginx_ingress_controller_ssl_expire_time_seconds` | 证书过期时间 | < 30 天告警 |
 
-### Access Log → Loki
+---
 
-| 维度 | 说明 |
-|------|------|
-| 状态码分布 | 4xx/5xx 比例异常告警 |
-| 热点接口 | Top 10 URI 请求量 |
-| 客户端 IP 分布 | DDoS / 爬虫识别 |
+## 4. 采集器方案对比
+
+| 采集器 | 部署方式 | 指标覆盖 | 日志支持 | 适用场景 |
+| --- | --- | --- | --- | --- |
+| nginx-prometheus-exporter | Sidecar / 二进制 | stub_status | 无 | 独立 Nginx |
+| NGINX Ingress Controller metrics | 内置端点 | Ingress 全量 | 无 | K8s Ingress |
+| **Grafana Alloy** | `prometheus.scrape` + Loki | exporter/Ingress 指标 | JSON access log | **本项目首选** |
+| OpenResty + lua | 应用内指标 | 自定义细粒度 | 无 | 深度定制 |
 
 ---
 
-## 采集集成
+## 5. Alloy 集成方案（推荐）
 
-```yaml
-# Nginx stub_status 配置
+### 5.1 独立 Nginx exporter
+
+```alloy
+discovery.relabel "nginx" {
+  targets = [{ __address__ = "nginx-exporter.web.svc:9113" }]
+  rule { target_label = "instance" replacement = "nginx-main" }
+}
+
+prometheus.scrape "nginx" {
+  targets = discovery.relabel.nginx.output
+  forward_to = [prometheus.remote_write.central.receiver]
+  job_name = "integrations/nginx"
+}
+```
+
+### 5.2 多实例采集
+```alloy
+discovery.relabel "nginx_node1" {
+  targets = [{ __address__ = "nginx-node1:9113" }]
+  rule { target_label = "instance" replacement = "nginx-node1" }
+}
+
+discovery.relabel "nginx_node2" {
+  targets = [{ __address__ = "nginx-node2:9113" }]
+  rule { target_label = "instance" replacement = "nginx-node2" }
+}
+
+prometheus.scrape "nginx_cluster" {
+  targets = concat(discovery.relabel.nginx_node1.output, discovery.relabel.nginx_node2.output)
+  forward_to = [prometheus.remote_write.central.receiver]
+  job_name = "integrations/nginx"
+}
+```
+
+### 5.3 Ingress NGINX
+```alloy
+prometheus.scrape "nginx_ingress" {
+  targets = [{ __address__ = "ingress-nginx-controller.ingress.svc:10254" }]
+  forward_to = [prometheus.remote_write.central.receiver]
+  job_name = "nginx-ingress"
+}
+```
+
+### 5.4 JSON access log 采集
+```alloy
+local.file_match "nginx_access" {
+  path_targets = [{ __path__ = "/var/log/nginx/json_access.log", job = "integrations/nginx" }]
+}
+
+loki.source.file "nginx_access" {
+  targets = local.file_match.nginx_access.targets
+  forward_to = [loki.write.default.receiver]
+}
+```
+
+---
+
+## 6. Nginx 前置配置
+
+```nginx
 server {
-  listen 8080;
-  location /basic_status {
+  listen 127.0.0.1:8080;
+  location /stub_status {
     stub_status on;
     access_log off;
-    allow 127.0.0.1;
-    allow 10.0.0.0/8;
-    deny all;
   }
 }
 
-# nginx-prometheus-exporter 启动
-nginx-prometheus-exporter --nginx.scrape-uri=http://nginx:8080/basic_status
-
-# Prometheus scrape
-- job_name: nginx
-  static_configs:
-    - targets:
-        - "nginx-exporter:9113"
-      labels:
-        service: nginx
-        env: prod
-
-# K8s Ingress Controller 内置
-- job_name: nginx-ingress
-  kubernetes_sd_configs:
-    - role: pod
-  relabel_configs:
-    - source_labels: [__meta_kubernetes_pod_label_app_kubernetes_io_name]
-      regex: ingress-nginx
-      action: keep
-    - source_labels: [__address__]
-      action: replace
-      regex: (.+):(\d+)
-      replacement: $1:10254
-      target_label: __address__
+log_format json_analytics escape=json '{"msec":"$msec","request":"$request","status":"$status","request_time":"$request_time","http_user_agent":"$http_user_agent"}';
+access_log /var/log/nginx/json_access.log json_analytics;
 ```
 
 ---
 
-## 告警规则
+## 7. 告警规则
 
 ```yaml
-- alert: NginxConnectionsHigh
-  expr: nginx_connections_active > 1000
-  for: 5m
-  annotations:
-    summary: "Nginx 活跃连接数 {{ $value }}"
+groups:
+- name: nginx.rules
+  rules:
+  - alert: NginxDown
+    expr: nginx_up == 0
+    for: 1m
+    labels: { severity: critical }
+    annotations: { summary: "Nginx exporter 不可达" }
 
-- alert: NginxUpstreamLatencyHigh
-  expr: histogram_quantile(0.99, rate(nginx_ingress_controller_ingress_upstream_latency_seconds_bucket[5m])) > 2
-  for: 3m
-  annotations:
-    summary: "Nginx 上游 P99 延迟 > 2s"
+  - alert: NginxUpstreamLatencyHigh
+    expr: histogram_quantile(0.99, rate(nginx_ingress_controller_ingress_upstream_latency_seconds_bucket[5m])) > 2
+    for: 5m
+    labels: { severity: warning }
+    annotations: { summary: "Nginx Ingress 上游 P99 延迟超过 2s" }
 
-- alert: NginxSSLCertExpiring
-  expr: nginx_ingress_controller_ssl_expire_time_seconds - time() < 2592000
-  annotations:
-    summary: "SSL 证书将在 30 天内过期"
+  - alert: NginxSSLCertExpiring
+    expr: nginx_ingress_controller_ssl_expire_time_seconds - time() < 2592000
+    for: 1h
+    labels: { severity: warning }
+    annotations: { summary: "Nginx Ingress 证书将在 30 天内过期" }
 ```
 
 ---
 
-## 部署注意事项（混合部署适配）
+## 8. Grafana Dashboard
 
-| 部署方式 | 采集方式 |
-|---------|---------|
-| 二进制 Nginx | stub_status + nginx-prometheus-exporter 同机部署 |
-| Docker Nginx | nginx-prometheus-exporter 容器 sidecar |
-| K8s Ingress Controller | 10254/metrics 默认暴露，ServiceMonitor 自动发现 |
-
-Access log 通过 Promtail 采集到 Loki，可做流量分析和用户行为追踪。
+Grafana Cloud NGINX 集成提供 2 个预置 Dashboard（指标 + 日志），支持访问日志可视化、错误率、独立访客、GeoIP 国家映射。官方示例可通过 `alloy-scenarios/nginx-monitoring` 快速体验。
 
 ---
 
-## 采集器方案对比
+## 9. KAgent 集成（Nginx 运维 Agent）
 
-| 采集器 | 部署方式 | 指标覆盖 | 日志支持 | 适用场景 |
-|--------|---------|---------|---------|---------|
-| nginx-prometheus-exporter | 容器/二进制 | stub_status 转 Prometheus | 无 | 独立 Nginx 标准方案 |
-| K8s Ingress Controller | 内置 10254/metrics | Ingress 全量指标 | 需 Promtail | K8s Ingress 标准方案 |
-| Grafana Alloy | 抓取 exporter 端口 | 同上 | 内置 loki.source | Grafana 全栈 |
-| Netdata | 一键安装 | 内置 nginx collector | 内置日志查看 | 快速部署 |
-| OpenResty + lua-resty-prometheus | Lua 嵌入 | 自定义细粒度指标 | 无 | 需要深度定制 |
+推荐绑定 PrometheusServer 查询 QPS、5xx、上游延迟、证书过期，并结合 Loki 查询 access log；用 Git-Based Skills 注入 502/504、上游慢、证书过期、限流、访问日志排查 SOP。
 
 ---
 
-## Alloy 采集配置
+## 10. 常见问题
 
-```alloy
-// 独立 Nginx exporter
-prometheus.scrape "nginx" {
-  targets = [{ __address__ = "nginx-exporter.ingress.svc:9113", service = "nginx" }]
-  forward_to = [prometheus.remote_write.central.receiver]
-}
+### Grafana Alloy 支持采集 NGINX 指标吗？
 
-// K8s Ingress Controller 内置指标
-prometheus.scrape "nginx_ingress" {
-  targets = [{ __address__ = "ingress-nginx-controller.ingress.svc:10254", service = "nginx-ingress" }]
-  forward_to = [prometheus.remote_write.central.receiver]
-}
+**完全支持。** Alloy 通过 `prometheus.scrape` 抓取 nginx-prometheus-exporter 或 NGINX Ingress Controller 指标，通过 Loki 组件采集访问日志。
 
-prometheus.remote_write "central" {
-  endpoint { url = "http://prometheus.observability.svc:9090/api/v1/write" }
-}
-```
+### 为什么需要 nginx-prometheus-exporter？
 
----
+Nginx `stub_status` 不是 Prometheus 格式，需要 nginx-prometheus-exporter 转换；Ingress Controller 通常已内置 Prometheus 指标端点。
 
-## Netdata 方案
+### Grafana Cloud NGINX 集成还提供什么？
 
-Netdata 内置 nginx collector，自动采集活跃连接、请求数等：
-
-```bash
-docker run -d --name=netdata \
-  -p 19999:19999 \
-  --cap-add SYS_PTRACE \
-  -v /var/run/docker.sock:/var/run/docker.sock:ro \
-  netdata/netdata
-```
-
-> 前提：Nginx 需开启 `stub_status` 端点。Netdata 通过 HTTP 采集 stub_status 数据。
-
----
-
-## 方案对比
-
-| 维度 | nginx-exporter + Prometheus | Alloy | Netdata |
-|------|---------------------------|-------|---------|
-| 部署复杂度 | 中（需开 stub_status） | 中 | 低 |
-| Ingress 支持 | 需单独配置 | ✅ 内置 | ❌ |
-| Access Log 分析 | 需 Promtail + Loki | ✅ 内置 | ✅ 内置 |
-| Grafana 兼容 | ⭐⭐⭐⭐⭐ | ⭐⭐⭐⭐⭐ | ⭐⭐⭐ |
-| 推荐场景 | 独立 Nginx | Grafana 全栈 | 快速验证 |
+提供预置 Dashboard、告警、日志采集与 GeoIP2 相关的访问分析能力，适合从指标和访问日志两个角度定位 4xx/5xx、慢请求和异常来源。

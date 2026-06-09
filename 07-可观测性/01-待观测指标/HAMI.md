@@ -1,160 +1,153 @@
-﻿# HAMI 可观测性
+# HAMI 可观测性调研
 
-> HAMI 是 K8s GPU Device Plugin，支持显存虚拟化与隔离；其指标通过 K8s 设备插件 API 和节点级 Prometheus 端点暴露。
+**更新日期：** 2026年06月09日
+**信息来源：** 官方文档、GitHub 仓库、Grafana Alloy 官方回答、社区实践
+**参考地址：**
 
----
+1. HAMI GitHub：[Project-HAMi/HAMi](https://github.com/Project-HAMi/HAMi)
+2. HAMI 文档：[HAMi Documentation](https://project-hami.io/)
+3. NVIDIA DCGM Exporter：[NVIDIA/dcgm-exporter](https://github.com/NVIDIA/dcgm-exporter)
+4. Alloy 抓取配置：[prometheus.scrape](https://grafana.com/docs/alloy/latest/reference/components/prometheus/prometheus.scrape/)
 
-## 可观测性组件
-
-| 组件 | 说明 | 暴露方式 |
-|------|------|---------|
-| HAMI 内置 metrics | GPU 分配状态、显存池、vGPU 调度指标 | TCP 8080 /metrics（HAMI 进程）|
-| HAMI Core API | 查询 GPU 分配情况和节点状态 | REST API |
-| DCGM Exporter | GPU 硬件指标（与 HAMI 互补）| TCP 9400 /metrics |
-| nvidia-gpu-exporter | 进程级 GPU 显存归因 | TCP 9835 /metrics |
+> Grafana 官方知识来源没有 HAMi 专用 Alloy 集成；若 HAMI 暴露 Prometheus `/metrics`，Alloy 可通过通用 `prometheus.scrape` 抓取。
 
 ---
 
-## 核心指标
+## 1. 结论摘要
 
-### HAMI 指标
+HAMI 是 Kubernetes GPU 共享与虚拟化中间件，关注 GPU 分配、显存池、vGPU 调度和 Pod 资源申请状态。HAMI 指标需要与 DCGM Exporter 组合使用：HAMI 反映“分配视角”，DCGM 反映“硬件实际使用视角”。在 Alloy 体系下，HAMI 没有专用 exporter 组件，使用 `prometheus.scrape` 抓取 HAMI `/metrics` 和 DCGM `:9400/metrics`。
+
+| 关键信息 | 值 |
+| --- | --- |
+| 主流采集方式 | HAMI 内置 Prometheus 指标 + DCGM Exporter |
+| HAMI 指标 | GPU 分配、显存分配、vGPU、Pending 容器 |
+| DCGM 指标 | GPU 实际利用率、显存、温度、ECC/XID |
+| Alloy 集成 | `prometheus.scrape` 抓取 HAMI / DCGM 端点 |
+| 推荐组合 | HAMI 分配指标 + DCGM 硬件指标 + K8s Pod 指标 |
+
+---
+
+## 2. 产品概况（HAMI）
+
+| 项目 | 内容 |
+| --- | --- |
+| 产品名称 | HAMi / HAMI |
+| 类型 | Kubernetes GPU 共享、隔离与调度中间件 |
+| 部署形态 | DaemonSet / Scheduler 扩展 / Device Plugin |
+| 数据来源 | HAMI 调度与分配状态、节点 GPU 资源、Pod 注解 |
+| 互补组件 | DCGM Exporter、kube-state-metrics、kubelet cAdvisor |
+
+---
+
+## 3. 核心指标
 
 | 指标 | 含义 | 告警建议 |
-|------|------|---------|
-| `hami_node_gpu_total` | 节点 GPU 总数 | — |
-| `hami_node_gpu_allocated` | 已分配 GPU 数 | == total 说明无可用 GPU |
-| `hami_node_gpu_memory_total` | GPU 显存总量 | — |
+| --- | --- | --- |
+| `hami_node_gpu_total` | 节点 GPU 总数 | 与资产清单不一致告警 |
+| `hami_node_gpu_allocated` | 已分配 GPU 数 | == total 持续 10m 资源耗尽 |
+| `hami_node_gpu_memory_total` | GPU 显存池总量 | — |
 | `hami_node_gpu_memory_allocated` | 已分配显存 | > 90% 告警 |
-| `hami_pod_gpu_memory` | Pod 分配的显存 | — |
-| `hami_vgpu_count` | 虚拟 GPU 实例数 | — |
-| `hami_container_pending` | 等待 GPU 分配的容器数 | > 0 说明 GPU 资源不足 |
-
-### 与 DCGM 配合的 GPU 硬件指标
-
-| 指标（DCGM Exporter） | 含义 |
-|----------------------|------|
-| `DCGM_FI_DEV_GPU_UTIL` | GPU 算力利用率 |
-| `DCGM_FI_DEV_FB_USED` | GPU 显存使用量 |
-| `DCGM_FI_DEV_GPU_TEMP` | GPU 温度 |
-
-HAMI 分配的显存 vs DCGM 实际显存使用：差值 = 宿主机裸进程消耗的显存（不受 HAMI 管控的部分）。
+| `hami_pod_gpu_memory` | Pod 分配显存 | 用于租户核算 |
+| `hami_vgpu_count` | vGPU 实例数 | 异常突增关注 |
+| `hami_container_pending` | 等待 GPU 分配容器数 | > 0 持续 5m 告警 |
+| `DCGM_FI_DEV_FB_USED` | 实际显存使用 | 与 HAMI 分配差值用于裸进程识别 |
+| `DCGM_FI_DEV_GPU_UTIL` | GPU 实际利用率 | 长期低利用率资源浪费 |
 
 ---
 
-## 采集集成
+## 4. 采集器方案对比
 
-```yaml
-# Prometheus scrape（HAMI 进程 metrics）
-- job_name: hami
-  static_configs:
-    - targets:
-        - "gpu-node-1:8080"
-        - "gpu-node-2:8080"
-      labels:
-        service: hami
-        env: prod
-
-# K8s ServiceMonitor（使用 HAMI 的 Pod 自动发现）
-apiVersion: monitoring.coreos.com/v1
-kind: PodMonitor
-metadata:
-  name: hami-gpu-pods
-  namespace: observability
-spec:
-  selector:
-    matchLabels:
-      hami: enabled
-  podMetricsEndpoints:
-    - port: metrics
-      interval: 15s
-
-# 配合 DCGM Exporter 采集 GPU 硬件指标
-- job_name: dcgm
-  static_configs:
-    - targets:
-        - "gpu-node-1:9400"
-        - "gpu-node-2:9400"
-      labels:
-        service: dcgm
-        env: prod
-```
+| 采集器 | 部署方式 | 指标覆盖 | 适用场景 |
+| --- | --- | --- | --- |
+| HAMI 内置 `/metrics` | HAMI 组件端点 | GPU 分配 / vGPU / 显存池 | HAMI 标准指标 |
+| DCGM Exporter | DaemonSet | GPU 硬件实际状态 | 必须配合 |
+| Grafana Alloy | `prometheus.scrape` | 抓取 HAMI + DCGM | **本项目首选** |
+| Netdata | Agent | 基础 GPU 指标 | 快速验证 |
 
 ---
 
-## 告警规则
-
-```yaml
-- alert: HAMIGpuFullyAllocated
-  expr: hami_node_gpu_allocated == hami_node_gpu_total
-  for: 5m
-  annotations:
-    summary: "节点 {{ $labels.node }} GPU 已全部分配，新增 Pod 将 pending"
-
-- alert: HAMIMemoryHigh
-  expr: hami_node_gpu_memory_allocated / hami_node_gpu_memory_total * 100 > 90
-  for: 5m
-  annotations:
-    summary: "节点 {{ $labels.node }} GPU 显存分配率 > 90%"
-```
-
----
-
-## 部署注意事项（混合部署适配）
-
-| 部署方式 | 采集方式 |
-|---------|---------|
-| K8s + HAMI | HAMI 部署为 DaemonSet，自动暴露 /metrics 端口 |
-| Docker + GPU（无 HAMI）| 无法使用 HAMI 指标，直接依赖 DCGM Exporter 和 nvidia-gpu-exporter |
-| 宿主机直跑 GPU 进程（无 HAMI）| 无 HAMI 管控，仅通过 DCGM Exporter 看总显存使用 |
-
-**关键公式：** `DCGM显存使用 − HAMI分配显存 = 宿主机裸进程显存消耗（需关注的部分）`
-
----
-
-## 采集器方案对比
-
-| 采集器 | 部署方式 | 指标覆盖 | 日志支持 | 适用场景 |
-|--------|---------|---------|---------|---------|
-| HAMI 内置 /metrics | DaemonSet | GPU 分配/显存池/vGPU 调度 | 无 | HAMI 标准方案 |
-| DCGM Exporter | DaemonSet | GPU 硬件指标（互补） | 无 | 与 HAMI 配合使用 |
-| Grafana Alloy | 抓取 exporter 端口 | 同上 | 内置 loki.source | Grafana 全栈 |
-| Netdata | 一键安装 | 内置 nvidia_smi collector | 内置日志查看 | 快速部署 |
-
----
-
-## Alloy 采集配置
+## 5. Alloy 集成方案（推荐）
 
 ```alloy
-// HAMI 设备插件指标
 prometheus.scrape "hami" {
-  targets = [
-    { __address__ = "hami-device-plugin.gpu.svc:8080", service = "hami" },
-  ]
+  targets = [{ __address__ = "hami-device-plugin.kube-system.svc:8080", service = "hami" }]
+  scrape_interval = "30s"
   forward_to = [prometheus.remote_write.central.receiver]
+  job_name = "hami"
 }
 
-// DCGM GPU 硬件指标（与 HAMI 互补）
 prometheus.scrape "dcgm" {
-  targets = [
-    { __address__ = "dcgm-exporter.gpu.svc:9400", service = "dcgm" },
-  ]
+  targets = [{ __address__ = "dcgm-exporter.gpu.svc:9400", service = "dcgm" }]
+  scrape_interval = "15s"
   forward_to = [prometheus.remote_write.central.receiver]
+  job_name = "dcgm"
 }
+```
 
-prometheus.remote_write "central" {
-  endpoint { url = "http://prometheus.observability.svc:9090/api/v1/write" }
-}
+关键分析公式：
+
+```promql
+# 裸进程或非 HAMI 管控显存消耗估算
+DCGM_FI_DEV_FB_USED - hami_node_gpu_memory_allocated
 ```
 
 ---
 
-## 方案对比
+## 6. 部署与采集注意事项
 
-| 维度 | HAMI + DCGM + Prometheus | Alloy | Netdata |
-|------|------------------------|-------|---------|
-| 部署复杂度 | 中（HAMI + DCGM 两个 DaemonSet） | 中 | 低 |
-| GPU 分配指标 | ✅ HAMI | ✅ | ❌ |
-| GPU 硬件指标 | ✅ DCGM | ✅ | ✅（基础） |
-| vGPU 支持 | ✅ | ✅ | ❌ |
-| Grafana 兼容 | ⭐⭐⭐⭐⭐ | ⭐⭐⭐⭐⭐ | ⭐⭐⭐ |
-| 推荐场景 | K8s GPU 集群标准方案 | Grafana 全栈 | 快速验证 |
+| 场景 | 采集方式 |
+| --- | --- |
+| K8s + HAMI | 抓取 HAMI metrics + DCGM DaemonSet |
+| Docker GPU（无 HAMI）| 仅 DCGM + nvidia-gpu-exporter |
+| 宿主机裸进程 | DCGM 统计总显存，nvidia-gpu-exporter 做进程归因 |
+
+---
+
+## 7. 告警规则
+
+```yaml
+groups:
+- name: hami.rules
+  rules:
+  - alert: HAMIGpuFullyAllocated
+    expr: hami_node_gpu_allocated == hami_node_gpu_total
+    for: 10m
+    labels: { severity: warning }
+    annotations: { summary: "HAMI 节点 GPU 已全部分配" }
+
+  - alert: HAMIGpuMemoryAllocatedHigh
+    expr: hami_node_gpu_memory_allocated / hami_node_gpu_memory_total > 0.9
+    for: 5m
+    labels: { severity: warning }
+    annotations: { summary: "HAMI GPU 显存分配率超过 90%" }
+
+  - alert: HAMIGpuPendingContainers
+    expr: hami_container_pending > 0
+    for: 5m
+    labels: { severity: warning }
+    annotations: { summary: "存在等待 GPU 分配的容器" }
+```
+
+---
+
+## 8. Grafana Dashboard
+
+建议自建 HAMI Dashboard，核心面板包括：节点 GPU 分配率、显存分配率、Pod 分配 TopN、Pending 容器、HAMI 分配显存与 DCGM 实际显存差值。
+
+---
+
+## 9. KAgent 集成（HAMI 运维 Agent）
+
+推荐绑定 PrometheusServer 查询 HAMI、DCGM、kube-state-metrics 指标，并通过 Skills 注入 GPU 调度、Pending Pod、裸进程显存排查 SOP。
+
+---
+
+## 10. 常见问题
+
+### Grafana Alloy 能采集 HAMI 指标吗？
+
+**可以，但不是专用集成。** Grafana 官方知识来源没有 HAMI 专用 Alloy 文档；只要 HAMI 暴露 Prometheus `/metrics`，Alloy 就能通过 `prometheus.scrape` 抓取。
+
+### HAMI 指标能替代 DCGM 吗？
+
+不能。HAMI 表示资源“分配”，DCGM 表示硬件“实际使用”。两者差值能发现宿主机裸进程或非 HAMI 管控进程占用显存。

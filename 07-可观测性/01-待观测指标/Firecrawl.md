@@ -1,157 +1,169 @@
-﻿# Firecrawl 可观测性
+# Firecrawl 可观测性调研
 
-> Firecrawl 是 AI 爬虫服务，指标需要从应用层自行暴露（无标准 Exporter）。
+**更新日期：** 2026年06月09日
+**信息来源：** 官方文档、GitHub 仓库、Grafana Alloy 官方回答、社区实践
+**参考地址：**
 
----
+1. Firecrawl GitHub：[mendableai/firecrawl](https://github.com/mendableai/firecrawl)
+2. Firecrawl 文档：[Firecrawl Docs](https://docs.firecrawl.dev/)
+3. Alloy 抓取配置：[prometheus.scrape](https://grafana.com/docs/alloy/latest/reference/components/prometheus/prometheus.scrape/)
+4. Blackbox Exporter：[prometheus/blackbox_exporter](https://github.com/prometheus/blackbox_exporter)
 
-## 可观测性组件
-
-| 组件 | 说明 | 暴露方式 |
-|------|------|---------|
-| 应用内 metrics | 自行埋点暴露爬虫运行指标 | TCP（自定义端口）/metrics |
-| 应用日志 | 爬虫任务日志（stdout → Loki）| 容器 stdout |
-| 外部探活 | 可用性拨测 | Blackbox Exporter HTTP probe |
-
-Firecrawl 目前无社区 Prometheus Exporter，需在代码中集成 Prometheus 客户端库（Python：`prometheus_client`）。
+> Grafana 官方知识来源没有 Firecrawl 专用集成。以下方案基于通用 Prometheus 端点、应用埋点、日志采集和 HTTP 拨测设计。
 
 ---
 
-## 核心指标
+## 1. 结论摘要
 
-### 建议埋点指标
+Firecrawl 是网页抓取/爬虫服务，通常没有标准 Prometheus exporter。生产可观测性需要应用侧主动暴露 `/metrics`，并结合日志与外部拨测。Grafana Alloy **可以采集 Firecrawl 指标**，前提是 Firecrawl 或自定义 exporter 暴露 Prometheus 格式端点；否则只能采集日志和做 HTTP 探活。
 
-| 指标 | 类型 | 含义 | 建议 |
-|------|------|------|------|
-| `firecrawl_crawl_requests_total` | Counter | 爬取请求总数（按 domain/status 分）| 必埋 |
-| `firecrawl_crawl_duration_seconds` | Histogram | 单次爬取耗时 | 必埋 |
-| `firecrawl_pages_scraped_total` | Counter | 已抓取页面数 | 推荐 |
-| `firecrawl_tokens_consumed_total` | Counter | 爬取消耗的 Token 数 | 推荐 |
-| `firecrawl_errors_total` | Counter | 错误数（按错误类型分）| 必埋 |
-| `firecrawl_queue_depth` | Gauge | 当前爬取队列深度 | 推荐 |
-| `firecrawl_concurrent_requests` | Gauge | 当前并发爬取数 | 推荐 |
-
-### 日志监控
-
-| 维度 | 说明 |
-|------|------|
-| 错误日志频率 | `ERROR` 级别日志率 > 阈值告警 |
-| 爬取失败率 | 连续失败数 > 阈值告警 |
-| 目标站点不可达 | DNS 解析失败 / 连接超时 |
+| 关键信息 | 值 |
+| --- | --- |
+| 主流采集方式 | 应用自定义 Prometheus 埋点 |
+| 指标端口 | 自定义，例如 TCP `9100` `/metrics` |
+| Alloy 集成 | `prometheus.scrape` 抓取自定义端点 |
+| 可用性监控 | Blackbox Exporter / Alloy scrape blackbox |
+| 日志采集 | 容器 stdout -> Loki |
 
 ---
 
-## 采集集成
+## 2. 产品概况（应用自定义指标）
 
-```yaml
-# Firecrawl 代码中集成 metrics 端点
-# Python 示例
-from prometheus_client import start_http_server, Counter, Histogram
-
-FIRE_UP = Counter('firecrawl_crawl_requests_total', '爬取请求', ['domain'])
-FIRE_DURATION = Histogram('firecrawl_crawl_duration_seconds', '爬取耗时', ['domain'],
-                          buckets=[1, 5, 10, 30, 60, 120])
-
-# 启动 metrics server
-start_http_server(9100)
-
-# Prometheus scrape
-- job_name: firecrawl
-  static_configs:
-    - targets:
-        - "firecrawl-host:9100"
-      labels:
-        service: firecrawl
-        env: prod
-
-# 可用性拨测
-- job_name: firecrawl-blackbox
-  metrics_path: /probe
-  params:
-    module: [http_2xx]
-  static_configs:
-    - targets:
-        - "http://firecrawl-host:8080/health"
-  relabel_configs:
-    - source_labels: [__address__]
-      target_label: __param_target
-    - source_labels: [__param_target]
-      target_label: instance
-    - target_label: __address__
-      replacement: blackbox-exporter:9115
-```
+| 项目 | 内容 |
+| --- | --- |
+| 产品名称 | Firecrawl |
+| 类型 | AI 爬虫 / 网页抓取服务 |
+| 指标来源 | 应用代码埋点、任务队列、HTTP 健康检查、日志 |
+| 标准 exporter | 暂无官方 Prometheus exporter |
+| 推荐方式 | `prometheus_client` / OpenTelemetry SDK 暴露业务指标 |
 
 ---
 
-## 告警规则
+## 3. 核心指标
 
-```yaml
-- alert: FirecrawlErrorRateHigh
-  expr: rate(firecrawl_errors_total[5m]) / rate(firecrawl_crawl_requests_total[5m]) * 100 > 10
-  for: 5m
-  annotations:
-    summary: "Firecrawl 错误率超过 10%"
-
-- alert: FirecrawlHighLatency
-  expr: histogram_quantile(0.95, rate(firecrawl_crawl_duration_seconds_bucket[5m])) > 30
-  for: 5m
-  annotations:
-    summary: "Firecrawl P95 爬取耗时超过 30s"
-```
+| 指标 | 类型 | 含义 | 告警建议 |
+| --- | --- | --- | --- |
+| `firecrawl_crawl_requests_total` | Counter | 爬取请求总数 | 错误率分母 |
+| `firecrawl_crawl_duration_seconds` | Histogram | 单次爬取耗时 | P95 > 30s 告警 |
+| `firecrawl_pages_scraped_total` | Counter | 已抓取页面数 | 吞吐量骤降关注 |
+| `firecrawl_errors_total` | Counter | 错误数（按类型）| 错误率 > 10% 告警 |
+| `firecrawl_queue_depth` | Gauge | 当前队列深度 | 持续增长告警 |
+| `firecrawl_concurrent_requests` | Gauge | 当前并发数 | 接近上限关注 |
+| `firecrawl_tokens_consumed_total` | Counter | Token 消耗 | 成本核算 |
 
 ---
 
-## 部署注意事项（混合部署适配）
-
-| 部署方式 | 采集方式 |
-|---------|---------|
-| Docker Firecrawl | 容器内集成 prometheus_client 暴露 9100 |
-| K8s Firecrawl | Pod 中集成 metrics + ServiceMonitor |
-
-Firecrawl 本身不提供指标端点，所有监控能力需要从代码层面自行埋点。建议至少埋入请求计数、错误计数和延迟分布三个基础指标。
-
----
-
-## 采集器方案对比
+## 4. 采集器方案对比
 
 | 采集器 | 部署方式 | 指标覆盖 | 日志支持 | 适用场景 |
-|--------|---------|---------|---------|---------|
-| 自定义 prometheus_client | 代码埋点 | 自定义业务指标 | 无 | 唯一方案（无社区 Exporter） |
-| Grafana Alloy | 抓取自定义端口 | 同上 | 内置 loki.source | Grafana 全栈 |
+| --- | --- | --- | --- | --- |
+| 自定义 Prometheus 埋点 | 应用内集成 | 业务指标全量 | 无 | **生产推荐** |
+| Grafana Alloy | `prometheus.scrape` | 抓取自定义端点 | Loki 采集 stdout | Grafana 全栈 |
 | Blackbox Exporter | 外部探活 | HTTP 可用性 | 无 | 补充拨测 |
-
-> Firecrawl 无社区 Exporter，必须在源码中集成 `prometheus_client`，这是所有方案的共同前提。
+| OpenTelemetry SDK | 应用内集成 | 指标 / Trace / 日志 | 支持 | 需要链路追踪时 |
 
 ---
 
-## Alloy 采集配置
+## 5. Alloy 集成方案（推荐）
+
+### 5.1 抓取 Firecrawl 自定义指标端点
 
 ```alloy
-// Firecrawl 自定义指标端口
 prometheus.scrape "firecrawl" {
-  targets = [{ __address__ = "firecrawl.ai.svc:9100", service = "firecrawl" }]
+  targets = [{ __address__ = "firecrawl.ai.svc.cluster.local:9100", service = "firecrawl" }]
+  metrics_path = "/metrics"
+  scrape_interval = "30s"
   forward_to = [prometheus.remote_write.central.receiver]
+  job_name = "firecrawl"
 }
+```
 
-// Blackbox 可用性拨测
+### 5.2 HTTP 可用性拨测
+
+```alloy
 prometheus.scrape "firecrawl_blackbox" {
-  targets    = [{ __address__ = "http://firecrawl.ai.svc:8080/health" }]
+  targets      = [{ __address__ = "blackbox-exporter.observability.svc:9115" }]
   metrics_path = "/probe"
-  params     = { module = ["http_2xx"] }
-  forward_to = [prometheus.remote_write.central.receiver]
+  params       = { module = ["http_2xx"], target = ["http://firecrawl.ai.svc:8080/health"] }
+  forward_to   = [prometheus.remote_write.central.receiver]
 }
+```
 
-prometheus.remote_write "central" {
-  endpoint { url = "http://prometheus.observability.svc:9090/api/v1/write" }
-}
+### 5.3 容器日志采集
+
+```logql
+{app="firecrawl"} |= "ERROR"
 ```
 
 ---
 
-## 方案对比
+## 6. 应用埋点示例
 
-| 维度 | 自定义埋点 + Prometheus | Alloy | Blackbox 补充 |
-|------|----------------------|-------|--------------|
-| 部署复杂度 | 高（需代码改动） | 中 | 低 |
-| 指标内容 | 完全自定义 | 完全自定义 | 仅可用性 |
-| 开发团队配合 | 必须 | 必须 | 不需要 |
-| 推荐场景 | 内部服务 | Grafana 全栈 | 外部拨测补充 |
+```python
+from prometheus_client import Counter, Histogram, Gauge, start_http_server
+
+REQUESTS = Counter("firecrawl_crawl_requests_total", "Crawl requests", ["domain", "status"])
+ERRORS = Counter("firecrawl_errors_total", "Crawl errors", ["type"])
+DURATION = Histogram("firecrawl_crawl_duration_seconds", "Crawl duration", ["domain"], buckets=[1, 5, 10, 30, 60, 120])
+QUEUE_DEPTH = Gauge("firecrawl_queue_depth", "Crawl queue depth")
+
+start_http_server(9100)
+```
+
+---
+
+## 7. 告警规则
+
+```yaml
+groups:
+- name: firecrawl.rules
+  rules:
+  - alert: FirecrawlErrorRateHigh
+    expr: rate(firecrawl_errors_total[5m]) / rate(firecrawl_crawl_requests_total[5m]) > 0.1
+    for: 5m
+    labels: { severity: warning }
+    annotations:
+      summary: "Firecrawl 错误率超过 10%"
+
+  - alert: FirecrawlHighLatency
+    expr: histogram_quantile(0.95, rate(firecrawl_crawl_duration_seconds_bucket[5m])) > 30
+    for: 5m
+    labels: { severity: warning }
+    annotations:
+      summary: "Firecrawl P95 爬取耗时超过 30s"
+
+  - alert: FirecrawlQueueBacklogHigh
+    expr: firecrawl_queue_depth > 1000
+    for: 10m
+    labels: { severity: warning }
+    annotations:
+      summary: "Firecrawl 队列积压过高"
+```
+
+---
+
+## 8. Grafana Dashboard
+
+建议自建 Firecrawl Dashboard，包含请求量、错误率、P95/P99 延迟、队列深度、并发数、Token 消耗、Top Domain 错误分布。
+
+---
+
+## 9. KAgent 集成（Firecrawl 运维 Agent）
+
+推荐绑定 PrometheusServer 查询爬虫指标，并用 Git-Based Skills 注入失败重试、站点限流、 robots.txt 和成本控制规范。
+
+---
+
+## 10. 常见问题
+
+### Grafana Alloy 能采集 Firecrawl 指标吗？
+
+**可以，但前提是 Firecrawl 暴露 Prometheus 指标端点。** Grafana 官方知识来源没有 Firecrawl 专用集成，因此 Alloy 只能使用通用 `prometheus.scrape` 抓取自定义 `/metrics`。
+
+### Firecrawl 没有指标端点怎么办？
+
+需要在应用代码中集成 Prometheus SDK，或写一个外部 exporter 调用 Firecrawl API 并转换为 Prometheus 格式。短期可先用 Blackbox Exporter 做 HTTP 可用性探测。
+
+### 最少需要埋哪些指标？
+
+至少包含请求总数、错误总数、请求耗时 Histogram、队列深度和当前并发数。这 5 类指标能覆盖可用性、性能、容量和成本分析的基础面。

@@ -1,0 +1,33 @@
+workflow:
+  id: test-webhook-notify
+  description: 创建模拟告警，用DeepSeek诊断，发送到飞书
+  triggers:
+    - type: manual
+  steps:
+    - name: diagnose-with-deepseek
+      provider:
+        type: deepseek
+        config: "{{ providers.my_deepseek }}"
+        with:
+          model: "deepseek-chat"
+          system_prompt: "你是一个SRE专家，请对告警进行根因分析并给出处理建议。"
+          prompt: "告警名称：测试告警，严重级别：critical，状态：firing。请分析可能的原因和处理步骤。"
+          max_tokens: 500
+  actions:
+    - name: create-fake-alert
+      provider:
+        type: keep
+        with:
+          alert:
+            name: "测试告警"
+            severity: "critical"
+            status: "firing"
+    - name: notify-feishu
+      provider:
+        type: webhook
+        config: "{{ providers.my_feishu }}"
+        with:
+          body:
+            msg_type: "text"
+            content:
+              text: "告警触发：critical\n\nAI诊断结果：{{ steps.diagnose-with-deepseek.results }}"

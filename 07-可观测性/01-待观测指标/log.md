@@ -1,6 +1,6 @@
 # 日志可观测性
 
-> 日志是可观测性三大支柱之一（Metrics / Logs / Traces）。本文梳理 Docker、二进制服务、Kubernetes 三种场景下的日志采集方案，对比 Promtail、Alloy、Filebeat 等采集器，并给出 Prometheus + Loki 全链路方案的选型建议。
+> 日志是可观测性三大支柱之一（Metrics / Logs / Traces）。本文梳理 Docker、二进制服务、Kubernetes 三种场景下的日志采集方案，对比 Promtail、Alloy、Filebeat、Fluent Bit、Vector 等采集器，并给出 Prometheus + Loki 全链路方案的选型建议。
 
 ---
 
@@ -352,9 +352,96 @@ setup.kibana:
 
 ---
 
-## 六、采集器方案总结
+## 六、方案四：Vector 高性能日志管道
 
-### 6.1 决策树
+### 6.1 架构
+
+Vector 是 Datadog 开源的高性能可观测数据管道，适合日志吞吐量大、需要复杂解析/重映射、需要同时输出到 Loki、Elasticsearch、S3、Kafka、HTTP 等多个后端的场景。它不是 Grafana 原生组件，但可以通过 `loki` sink 与 Loki 集成，也可以通过 `prometheus_exporter` 暴露自身运行指标。
+
+```
+Docker Host / K8s Node
+├── Vector（Agent / DaemonSet）
+│   ├── sources：docker_logs / kubernetes_logs / file / journald
+│   ├── transforms：remap / filter / route / reduce
+│   └── sinks：loki / elasticsearch / s3 / kafka / console
+└── Loki / Elasticsearch / S3 / Kafka
+    └── Grafana / Kibana / 下游分析系统
+```
+
+### 6.2 Vector 配置（Docker -> Loki）
+
+```toml
+[sources.docker]
+type = "docker_logs"
+
+[sources.internal_metrics]
+type = "internal_metrics"
+
+[transforms.parse_json]
+type = "remap"
+inputs = ["docker"]
+source = '''
+.app = .label."com.docker.compose.service" ?? .container_name
+.level = downcase(string!(.level ?? "info"))
+'''
+
+[sinks.loki]
+type = "loki"
+inputs = ["parse_json"]
+endpoint = "http://loki:3100"
+encoding.codec = "json"
+labels.job = "vector-docker"
+labels.container = "{{ container_name }}"
+labels.level = "{{ level }}"
+
+[sinks.vector_metrics]
+type = "prometheus_exporter"
+inputs = ["internal_metrics"]
+address = "0.0.0.0:9598"
+```
+
+### 6.3 Vector 配置（Kubernetes -> Loki）
+
+```toml
+[sources.kubernetes]
+type = "kubernetes_logs"
+
+[transforms.enrich]
+type = "remap"
+inputs = ["kubernetes"]
+source = '''
+.namespace = .kubernetes.pod_namespace
+.pod = .kubernetes.pod_name
+.container = .kubernetes.container_name
+.app = .kubernetes.pod_labels.app ?? .kubernetes.container_name
+'''
+
+[sinks.loki]
+type = "loki"
+inputs = ["enrich"]
+endpoint = "http://loki:3100"
+encoding.codec = "json"
+labels.namespace = "{{ namespace }}"
+labels.pod = "{{ pod }}"
+labels.container = "{{ container }}"
+labels.app = "{{ app }}"
+```
+
+### 6.4 Vector 适用边界
+
+| 维度 | 说明 |
+| --- | --- |
+| 优势 | 高吞吐、低资源占用、VRL 转换能力强、多目标输出能力强 |
+| 不足 | 配置模型和 VRL 需要学习；Grafana 栈中不如 Alloy/Promtail 原生 |
+| 适合 | 大日志量、多后端分发、日志清洗/脱敏/路由复杂的场景 |
+| 不适合 | 只需要 Loki 基础采集且团队已标准化 Alloy 的场景 |
+| 与 Alloy 关系 | Vector 负责日志管道；Alloy 可继续负责指标、trace、Loki 原生日志采集 |
+
+---
+
+## 七、采集器方案总结
+
+### 7.1 决策树
 
 ```
 需要日志采集？
@@ -368,11 +455,11 @@ setup.kibana:
 │   ├── 是 → Fluent Bit（~1MB 内存）
 │   └── 否 → Promtail / Alloy
 └── 需要多目标输出？
-    ├── 是 → Fluentd / Vector
+    ├── 是 → Vector（高性能）/ Fluentd（插件生态）
     └── 否 → Promtail
 ```
 
-### 6.2 总结
+### 7.2 总结
 
 | 方案 | 部署复杂度 | 资源占用 | 生态兼容 | 推荐场景 |
 |------|-----------|---------|---------|---------|
@@ -381,18 +468,19 @@ setup.kibana:
 | **Filebeat + ES** | 中 | 中 | ⭐⭐⭐⭐⭐ | ELK 栈 |
 | **Fluent Bit** | 低 | 极低 | ⭐⭐⭐⭐ | 资源受限、多目标 |
 | **Fluentd** | 中 | 中 | ⭐⭐⭐⭐⭐ | 复杂多目标输出 |
-| **Vector** | 中 | 低 | ⭐⭐⭐⭐ | 高性能场景 |
+| **Vector** | 中 | 低 | ⭐⭐⭐⭐ | 高吞吐、多目标、复杂日志处理 |
 
-### 6.3 SmartVision 建议
+### 7.3 SmartVision 建议
 
 1. **已有 Prometheus + Grafana 栈**：使用 **Promtail + Loki**（最成熟），或升级为 **Alloy**（统一采集）
 2. **新项目、从零开始**：使用 **Alloy**（一套组件同时采集指标+日志）
 3. **已有 ELK 栈**：使用 **Filebeat**（与 Elasticsearch 原生集成）
 4. **资源受限环境**：使用 **Fluent Bit**（~1MB 内存占用）
+5. **高吞吐、多目标分发或复杂清洗**：使用 **Vector**，输出 Loki/Elasticsearch/S3/Kafka，并让 Alloy 继续承担指标和 trace 采集
 
 ---
 
-## 七、日志告警规则
+## 八、日志告警规则
 
 ```yaml
 groups:
@@ -428,13 +516,13 @@ groups:
 
 ---
 
-## 八、部署注意事项
+## 九、部署注意事项
 
 | 部署方式 | 采集要点 |
 |---------|---------|
 | Docker 单机 | Promtail/Alloy 挂载 `/var/lib/docker/containers` + `/var/run/docker.sock` |
 | Docker Compose | 日志驱动用 json-file（默认），采集端需访问宿主机目录 |
-| K8s DaemonSet | Promtail/Alloy 以 DaemonSet 部署，自动发现 Pod |
+| K8s DaemonSet | Promtail/Alloy/Vector 以 DaemonSet 部署，自动发现 Pod |
 | K8s 有状态服务 | 日志写文件场景需挂载 hostPath 或 emptyDir |
 | 混合部署 | Prometheus 采集指标 + Promtail/Alloy 采集日志，各自独立 |
 
@@ -442,4 +530,5 @@ groups:
 - Docker 默认 json-file driver 限制日志大小：`--log-opt max-size=10m --log-opt max-file=3`
 - 生产环境建议配置日志轮转，避免磁盘打满
 - Promtail/Alloy 的 positions 文件需持久化（hostPath），避免重启后重复采集
+- Vector 的 data_dir/checkpoint 需持久化，避免 Agent 重启后重复采集或丢失 offset
 - Loki 查询注意时间范围控制，避免全量扫描
